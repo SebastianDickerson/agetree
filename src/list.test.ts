@@ -1,6 +1,25 @@
 import { describe, expect, it } from "vitest";
 import type { LaneRecord, Status } from "./lane-state.ts";
-import { formatLanesJson, formatLanesTable, listLanes, type LaneRow } from "./list.ts";
+import { Writable } from "node:stream";
+import {
+  formatLanesJson,
+  formatLanesTable,
+  listLanes,
+  runList,
+  type LaneRow,
+} from "./list.ts";
+
+function collector(): Writable & { text: string } {
+  let text = "";
+  const stream = new Writable({
+    write(chunk, _enc, cb) {
+      text += chunk;
+      cb();
+    },
+  }) as Writable & { text: string };
+  Object.defineProperty(stream, "text", { get: () => text });
+  return stream;
+}
 
 /** A running lane record with sensible defaults; override per test. */
 function runningRecord(over: Partial<LaneRecord> = {}): LaneRecord {
@@ -263,5 +282,56 @@ describe("formatLanesTable", () => {
     // startedAt 0, endedAt 3_720_000ms = 62 minutes → 1h02m
     const out = formatLanesTable([doneRow({ startedAt: 0, endedAt: 3_720_000 })]);
     expect(out).toContain("1h02m");
+  });
+});
+
+describe("runList", () => {
+  const deps = {
+    repoRoot: "/repo",
+    now: () => 100_000,
+    isAlive: () => true,
+    listWorktrees: async () => new Map([["agetree/feature-x", "/wt/feature-x"]]),
+    readLaneNames: () => ["feature-x"],
+    readRecord: () => doneRow().record,
+  };
+
+  it("--json writes only the JSON array to stdout and exits 0", async () => {
+    const out = collector();
+    const err = collector();
+    const res = await runList({ ...deps, json: true, out, err });
+
+    expect(res.exitCode).toBe(0);
+    expect(err.text).toBe("");
+    const arr = JSON.parse(out.text);
+    expect(arr[0]).toMatchObject({ name: "feature-x", status: "done" });
+    expect(arr[0]).not.toHaveProperty("supervisorPid");
+  });
+
+  it("human mode writes the table to stdout and exits 0", async () => {
+    const out = collector();
+    const err = collector();
+    const res = await runList({ ...deps, json: false, out, err });
+
+    expect(res.exitCode).toBe(0);
+    expect(out.text).toContain("feature-x");
+    expect(out.text).toContain("agetree/feature-x");
+  });
+
+  it("exits 2 with empty stdout and a stderr diagnostic on an operational error", async () => {
+    const out = collector();
+    const err = collector();
+    const res = await runList({
+      ...deps,
+      json: true,
+      listWorktrees: async () => {
+        throw new Error("git boom");
+      },
+      out,
+      err,
+    });
+
+    expect(res.exitCode).toBe(2);
+    expect(out.text).toBe("");
+    expect(err.text).toMatch(/git boom/);
   });
 });

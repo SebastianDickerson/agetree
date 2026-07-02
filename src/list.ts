@@ -12,6 +12,7 @@
  * of the same views, so the JSON array and the human table can never drift.
  */
 
+import type { Writable } from "node:stream";
 import { defaultWorktreeReader, type WorktreeReader } from "./engine.ts";
 import { reconcile, type LaneRecord } from "./lane-state.ts";
 import { listLaneNames, readLaneRecord } from "./lane-store.ts";
@@ -188,6 +189,35 @@ export function formatLanesTable(views: LaneView[], opts: { now?: () => number }
 
 function maxWidth(rows: Columns[], key: keyof Columns): number {
   return rows.reduce((m, r) => Math.max(m, r[key].length), 0);
+}
+
+// ── Orchestration ───────────────────────────────────────────────────────────
+
+export type RunListOptions = ListLanesOptions & {
+  json?: boolean;
+  out?: Writable;
+  err?: Writable;
+};
+
+export type RunListResult = { exitCode: number };
+
+/**
+ * The `agetree ls` command: list + reconcile + shape output. Under `--json`,
+ * stdout carries only the JSON array and diagnostics go to stderr. Exit 0
+ * normally, 2 on an operational error (e.g. git/dir read failure). Never writes
+ * lane state and never kills — it only derives.
+ */
+export async function runList(opts: RunListOptions): Promise<RunListResult> {
+  const out = opts.out ?? process.stdout;
+  const err = opts.err ?? process.stderr;
+  try {
+    const views = await listLanes(opts);
+    out.write(opts.json ? formatLanesJson(views) : formatLanesTable(views, { now: opts.now }));
+    return { exitCode: 0 };
+  } catch (error) {
+    err.write(`agetree: ${error instanceof Error ? error.message : String(error)}\n`);
+    return { exitCode: 2 };
+  }
 }
 
 /** Humanize a duration in ms: "12.4s", "1m30s", "1h02m". */
