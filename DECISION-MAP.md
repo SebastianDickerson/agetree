@@ -392,7 +392,7 @@ test "$status" = done
 ## ts-bash-boundary: Which Responsibilities Cross The TS↔Bash Seam
 
 Blocked by: cli-surface
-Status: open
+Status: resolved
 Type: Grilling
 
 ### Question
@@ -404,7 +404,139 @@ output, and error/version handling across the seam. Keep the seam thin and one-d
 
 ### Answer
 
-<open>
+Resolved by grilling. The seam is **one-directional and effect-only**: TS is the public
+orchestrator and shells out to the Bash engine for the lifecycle effects the Bash already
+does well; Bash remains unaware of `.agetree/` lane state, adapters, payloads, and TS. TS
+must **not parse human Bash output** as a data protocol. If TS needs facts, it derives them
+from git (`git worktree list --porcelain`, `git status`, `rev-parse`, `merge-base`) and the
+lane record.
+
+### Ownership split
+
+**Bash engine owns the proven worktree/runtime mechanics:**
+
+- `new <branch> [base]` — create or check out the lane worktree, choose the default base
+  when no explicit base is supplied, allocate env/ports, copy/link env files, handle
+  git-crypt, install dependencies, and write `.agent-ports` / `.lando.local.yml`.
+- `run <branch>` — start the interactive dev stack for a worktree. This is **not** the
+  headless agent run path.
+- `merge <target> [branches...] [--all] [--rm]` — preserve the existing safe merge-back
+  behavior: dirty-worktree checks, clean-main-checkout check, conflict messaging, container
+  teardown, optional worktree cleanup.
+- `rm <branch>` — remove/tear down an interactive worktree using the existing runtime
+  cleanup. Lane record/log pruning remains `lane-gc`'s job.
+- `ls` — only the legacy worktree-centric human table, exposed under `agetree engine ls` or
+  other compatibility passthroughs. It is **not** the implementation of public `agetree ls`.
+
+**TS orchestrator owns everything that makes a lane headless and machine-readable:**
+
+- public CLI parsing/routing (`agetree run`, `ls`, `logs`, `merge`, `rm`, `engine …`) and all
+  `--json` / `--wait` behavior;
+- prompt ingestion, auto-naming, lane-name ↔ branch resolution, and adapter selection;
+- the detached supervisor, agent adapters, stdout/stderr capture, log files, timeouts, and
+  `reconcile()`;
+- `.agetree/lanes/<name>.json` records and `.agetree/logs/<name>.log`;
+- auto-commit after a clean agent exit, commit failure handling, `filesChanged`, `baseSha`,
+  `commit.sha`, and the final `payload` shape;
+- public `agetree ls [--json]`, which is lane-centric: read lane records, read git worktrees
+  directly, derive `orphaned` / interactive worktrees, and never delegate to the Bash `ls`;
+- `logs` and later `gc`/`reap` lifecycle-owner behavior.
+
+### Headless `run` sequencing
+
+For v1, headless setup is intentionally **foreground before detach**:
+
+1. TS resolves/creates the lane name and canonical branch.
+2. TS checks `git worktree list --porcelain` for an existing worktree for that branch.
+3. If absent, TS invokes `agent-worktree.sh new <branch> [base]`.
+4. TS re-reads `git worktree list --porcelain` keyed by branch to find the actual worktree
+   path. If the path is still missing, that is an agetree operational error.
+5. Only after a real worktree exists does TS create the lane record/log and spawn the
+   detached supervisor that runs the selected agent adapter.
+
+This avoids inventing a `creating` lane status, keeps `running` meaning "a supervisor owns
+an existing lane worktree", and makes engine setup failures immediate operational errors
+(`exit 2`) rather than failed agent payloads for a lane that never existed. The cost is that
+`agetree run --prompt …` may block while the Bash `new` command installs dependencies; that
+is acceptable for v1 because it preserves the simpler state machine. If that becomes painful,
+add a later ticket for a `creating` status / setup-in-supervisor design.
+
+### Invocation contract
+
+- TS locates the engine as the repo-root `agent-worktree.sh` and invokes it with argv arrays
+  (`spawnFile`/`spawn`, no shell string construction):
+  - `new`: capture/tee engine stdout+stderr to the lane log when one exists, and otherwise
+    route progress to stderr. Under `--json`, stdout remains reserved for the single JSON
+    object only.
+  - interactive passthroughs (`agetree run <branch>` without prompt, `agetree engine …`, and
+    human `merge`/`rm`): use inherited stdio so prompts, dev servers, merge conflicts, and
+    container output behave exactly like the Bash script.
+  - `merge`/`rm` invoked from higher-level TS commands first normalize lane names to branch
+    names, then delegate the effect to Bash.
+- TS treats Bash stdout/stderr as **diagnostics**, never as structured data. The only stable
+  Bash signal TS consumes is process exit success/failure.
+- After every delegated effect that matters to TS, TS re-reads authoritative state from git
+  rather than trusting printed text:
+  - worktree path: `git worktree list --porcelain` keyed by `refs/heads/<branch>`;
+  - current branch/head: `git -C <worktree> rev-parse …`;
+  - dirty state/files: `git -C <worktree> status --porcelain`;
+  - review range: `git merge-base <base> HEAD` / `rev-parse HEAD`.
+
+### Error handling
+
+- In the headless setup path, a nonzero engine exit is an **agetree operational error**:
+  print diagnostics to stderr/log, do not emit a fake payload, and exit `2` (matching the
+  `cli-surface` contract). With no worktree, there is no mergeable lane result to report.
+- In background headless mode after setup succeeds, supervisor/adapter/auto-commit failures
+  are lane failures (`status: failed`) because a real lane record exists and owns the
+  lifecycle.
+- In passthrough compatibility mode, preserve the Bash engine's behavior and exit code; do
+  not remap it unless the TS wrapper itself failed before invoking Bash.
+- Under any `--json` mode, TS must keep agetree and engine diagnostics off stdout. stdout is
+  exactly the JSON object or empty on operational error.
+- If TS needs to show an engine failure in a lane log or terminal, include the engine command
+  name and exit code plus stderr excerpts; avoid depending on exact Bash prose.
+
+### Version / protocol handling
+
+No separate engine protocol version in v1. The Bash script and TS orchestrator are
+co-versioned in the same repo/package, and the seam deliberately has no machine-readable
+Bash protocol to negotiate. TS should fail fast if `agent-worktree.sh` is missing or not
+executable, and tests should cover the small set of delegated argv shapes.
+
+If agetree later distributes TS separately from the Bash engine, add an explicit
+`agent-worktree.sh engine-version` / `capabilities` command then. Do **not** add it now just
+to protect against a deployment model the project has not earned.
+
+### Design guardrails
+
+- Do not move port allocation, env-file handling, git-crypt setup, runtime detection, or
+  merge safety into TS in v1. That duplicates the engine instead of using it.
+- Do not make Bash read or mutate `.agetree/lanes`; that would turn the seam bidirectional
+  and split lane-state ownership.
+- Do not scrape `agent-worktree.sh ls` or success messages. If TS needs machine data, read
+  git directly or add a deliberately machine-readable engine command in a future ticket.
+- Keep the adapter seam separate from the TS↔Bash seam: adapters vary by external agent CLI;
+  the Bash engine varies by local repo/runtime worktree mechanics.
+- `merge --rm` and `rm` may remove worktrees, but lane record/log cleanup is still deferred
+  to `lane-gc` so post-supervisor disk mutation has one owner.
+
+### Handoff to implementation
+
+The smallest implementation slice is a TS `Engine` module with a tiny interface:
+
+```ts
+type Engine = {
+  ensureWorktree(branch: string, base?: string): Promise<{ branch: string; path: string }>;
+  runInteractive(branch: string): Promise<number>; // inherited stdio
+  merge(target: string, branches: string[], opts: { all?: boolean; rm?: boolean }): Promise<number>;
+  remove(branch: string, opts: { force?: boolean }): Promise<number>;
+};
+```
+
+Only `ensureWorktree` returns structured data, and it gets that data by re-reading git after
+calling Bash, not by parsing Bash. Public `ls`, `logs`, `run --prompt`, payload shaping, and
+lane GC stay outside this module.
 
 ## skill-design: The Agent-Facing "When To Fan Out" Skill
 
