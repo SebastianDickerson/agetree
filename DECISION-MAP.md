@@ -641,7 +641,7 @@ to invoke + read back), while deferring the exhaustive flag list to `agetree --h
 ## lane-gc: Pruning Terminal Lanes & Killing Timed-Out Processes
 
 Blocked by: cli-surface
-Status: in-progress
+Status: resolved
 Type: Grilling
 
 ### Question
@@ -660,4 +660,98 @@ that the record is still non-terminal before overwriting it.
 
 ### Answer
 
-<open>
+Resolved by grilling. `lane-gc` owns **every disk mutation and process kill that happens
+after the supervisor is gone**. One explicit verb concentrates the dangerous logic; the
+engine's `rm`/`merge --rm` reuse a slice of it for immediate per-lane cleanup.
+
+- **Verb topology — `agetree gc` is the sole full owner.** It does all three jobs across
+  the whole `.agetree/lanes/` set in one pass: **persist-heal → kill → prune**. `rm` and
+  `merge --rm` do only the narrow, **record-scoped** cleanup for the lane(s) they already
+  touch (delete that lane's `.json` + `.log` after the engine removes its worktree),
+  calling gc's internal delete helper. `reap` is dropped as a public verb (optional hidden
+  alias only) — one name for one concept. Keeps a single place to get the resurrection-race
+  guard right, and keeps `rm`/`merge --rm` thin so no divergent cleanup policy exists.
+
+- **Job 1 — persist-heal (guarded RMW, no lock).** For each lane, run the pure
+  `reconcile()` (`prototypes/lane-state/`). If `!changed`, skip (never rewrite a healthy
+  `running` or already-terminal record). If `changed` (`running`→`stale`/`timed-out`):
+  1. **re-read the file immediately before writing** and confirm it is *still* `running`
+     **and** `supervisorPid` is unchanged;
+  2. if it is now terminal, the supervisor won the race — **keep the supervisor's record,
+     discard gc's heal** (this is the resurrection-race guard the ticket called out);
+  3. write via **atomic temp + `rename()`** into the same lane file so concurrent readers
+     never see torn JSON.
+  One file per lane means the guard + atomic rename is sufficient — no lockfile.
+
+- **Job 2 — kill (process-group, `timed-out`-only by default).** The supervisor is spawned
+  detached via `setsid`, so it is a **process-group leader** with `pgid == supervisorPid`
+  and the agent child lives in that group. gc therefore signals the **whole group**
+  (`kill -TERM -<pgid>`), taking down supervisor + agent together rather than orphaning the
+  child.
+  - **`timed-out`** (supervisor alive, over budget): `SIGTERM` the group → wait **5s**
+    grace → `SIGKILL` the group, then persist `timed-out`. Guard: re-check the pid is still
+    alive *and* still this lane's supervisor (start-time / pgid sanity) right before
+    signalling, so a **recycled pid** is never hit.
+  - **`stale`** (supervisor pid already dead): **no kill by default** — nothing to signal,
+    and any reparented orphan child can't be reliably identified (pgid may be recycled after
+    the leader died), so a blind `kill -pgid` could hit an unrelated group. gc just persists
+    `stale`. Opt-in **`--kill-orphans`** does a best-effort group kill guarded by
+    pgid-still-exists for the rare wedged-child case.
+
+- **Job 3 — prune (terminal-only, agetree-artifacts-only).** Deletes only the `.json`
+  record + `.log`; **never touches the worktree or git branch** (that stays the Bash
+  engine's job — keeps the seam one-directional: TS owns `.agetree/`, Bash owns worktrees).
+  - Only **terminal** records are eligible (`done`/`failed`/`stale`/`timed-out`); `running`
+    is never pruned (an over-budget lane is healed+killed into `timed-out` first, then
+    becomes eligible on a later pass).
+  - **`orphaned` terminals** (worktree already removed): pruned **immediately** regardless
+    of age — the worktree is gone, so the record + log are pure litter.
+  - Terminals **whose worktree still exists** are spared until they age out (pruning them
+    early would silently demote them to a bare worktree in `ls` and lose the payload/log);
+    the expectation is you'll `merge --rm`/`rm` them, which deletes the record atomically
+    with the worktree.
+  - `rm`/`merge --rm` remain the **primary immediate cleanup**; gc's prune is the janitor
+    for leftovers (orphans + aged records).
+
+- **Retention — age primary, cap optional.** Age-based is the default knob: prune terminal
+  records whose `endedAt` is older than the window, default **7 days**, flag
+  `--older-than <duration>` (reuses `cli-surface`'s `--timeout` duration parser). A count
+  cap is a backstop, **off by default**: `--keep <n>` keeps the N most-recent terminals and
+  deletes older ones regardless of age (guards a runaway fan-out day). `orphaned` terminals
+  ignore the window and go immediately.
+
+- **Safety & ergonomics.**
+  - **`--dry-run`** — report what gc *would* heal/kill/prune per lane and touch nothing.
+  - **No opportunistic gc** — gc is **explicit-only** in v1. `ls`/`--wait`/`run` never
+    trigger it (consistent with `lane-state`'s "reads never write"; auto-running it from hot
+    commands reintroduces the concurrency/perf risks that decision avoided). The periodic
+    janitor is a deliberate manual (or cron/launchd) invocation; per-lane cleanup on
+    `rm`/`merge --rm` covers the common case.
+  - **`--json`** — structured summary `{healed:[…], killed:[…], pruned:[…], skipped:[…]}`
+    so a parent agent/script can gc and assert; human mode prints one line per action + a
+    tally.
+  - **Exit codes** (mirroring `cli-surface`): `0` = ran cleanly (even if nothing to do),
+    `2` = operational error (bad flag / unreadable dir). A failed kill on one lane is
+    reported but does not fail the whole run.
+  - **Final surface:** `agetree gc [--dry-run] [--json] [--older-than <dur>] [--keep <n>]
+    [--kill-orphans]`. No positional args (whole-set janitor); a future `agetree gc <lane>`
+    could scope it but isn't needed now.
+
+- **Command flow.**
+
+  ```
+  agetree gc
+    ├─ readdir .agetree/lanes/
+    ├─ for each lane: reconcile()
+    │     ├─ changed → guarded RMW heal (re-read + non-terminal + same-pid, atomic rename)
+    │     └─ timed-out → SIGTERM pgid, 5s, SIGKILL pgid
+    └─ prune terminals: orphaned→now, others→older-than / --keep    (record + log only)
+  ```
+
+- **Hands off.** The kill guard needs the record to carry a **pid-recycle discriminator**
+  (supervisor start-time, or rely on `pgid == supervisorPid` from `setsid`); this is a
+  small addition to the `lane-state` record's identity fields that `ts-bash-boundary` and
+  the eventual supervisor implementation must honour — the supervisor **must** be spawned
+  `setsid` as a group leader for group-kill to work. gc's `--json` summary schema follows
+  the same additive-only / omit-don't-null discipline as `result-payload`. Making gc
+  schedulable (cron/launchd) is an ops concern deferred to post-v1, not a decision ticket.
