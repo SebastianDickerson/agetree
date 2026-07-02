@@ -134,7 +134,7 @@ function defaultRunner(enginePath: string, cwd: string, redirectTo?: Writable): 
 }
 
 /** Parse `git worktree list --porcelain` into short-branch → path. */
-async function defaultWorktreeReader(cwd: string): Promise<Map<string, string>> {
+export async function defaultWorktreeReader(cwd: string): Promise<Map<string, string>> {
   const raw = await gitPorcelain(cwd);
   const map = new Map<string, string>();
   let path: string | null = null;

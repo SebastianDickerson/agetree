@@ -126,7 +126,8 @@ export function toPublicRecord(
   return { ...rest, orphaned };
 }
 
-const GLYPH: Record<string, string> = {
+/** Status → glyph, shared by the `run --wait` and `ls` human projections. */
+export const GLYPH: Record<string, string> = {
   done: "✓",
   running: "…",
   failed: "✗",
@@ -327,7 +328,8 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function processAlive(pid: number): boolean {
+/** Liveness probe via `process.kill(pid, 0)`; treats EPERM as alive. */
+export function processAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;

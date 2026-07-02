@@ -1,4 +1,11 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 import type { LaneRecord } from "./lane-state.ts";
 
@@ -24,6 +31,20 @@ export function statePaths(root: string, name: string): LaneStatePaths {
     logPath: join(logsDir, `${name}.log`),
     relativeLogPath,
   };
+}
+
+/**
+ * List the lane record names (file basenames sans `.json`) under
+ * `.agetree/lanes/`, sorted. A read: returns `[]` when the dir is absent and
+ * never creates it.
+ */
+export function listLaneNames(root: string): string[] {
+  const { lanesDir } = statePaths(root, "");
+  if (!existsSync(lanesDir)) return [];
+  return readdirSync(lanesDir)
+    .filter((f) => f.endsWith(".json"))
+    .map((f) => f.slice(0, -".json".length))
+    .sort();
 }
 
 export function readLaneRecord(root: string, name: string): LaneRecord | null {
