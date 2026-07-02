@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createFakeAdapter } from "./adapters/fake.ts";
@@ -165,5 +165,57 @@ describe("runLaneSupervisor", () => {
     expect(sh(repo, ["git", "status", "--porcelain", "--untracked-files=all"])).toContain(
       "src/broken.txt",
     );
+  });
+
+  it("always writes a terminal record when git bookkeeping fails after the agent ran", async () => {
+    const { repo } = freshRepo();
+    const adapter = createFakeAdapter({
+      finalMessage: "did the work",
+      writeFiles: [{ path: "src/work.txt", content: "unsaved\n" }],
+    });
+
+    // A base ref that does not exist makes the merge-base bookkeeping throw
+    // *after* the agent has already run and written files.
+    const record = await runLaneSupervisor({
+      repoRoot: repo,
+      worktreePath: repo,
+      name: "bookkeeping",
+      branch: "agetree/feature-x",
+      baseRef: "no-such-ref",
+      prompt: "do work",
+      adapter,
+      supervisorPid: 4321,
+      supervisorStartedAt: 1_234,
+    });
+
+    expect(record.status).toBe(STATUS.FAILED);
+    expect(record.payload?.reason).toMatch(/bookkeeping failed/i);
+    expect(record.payload?.commit).toEqual({ outcome: "error" });
+    // The lane record is persisted (not left stuck as `running`).
+    expect(readLaneRecord(repo, "bookkeeping")).toEqual(record);
+    // The dirty worktree is kept for inspection.
+    expect(sh(repo, ["git", "status", "--porcelain", "--untracked-files=all"])).toContain(
+      "src/work.txt",
+    );
+  });
+
+  it("creates the lane log with 0o600 permissions (logs can contain secrets)", async () => {
+    const { repo } = freshRepo();
+    const adapter = createFakeAdapter({ finalMessage: "hi" });
+
+    await runLaneSupervisor({
+      repoRoot: repo,
+      worktreePath: repo,
+      name: "secretlog",
+      branch: "agetree/feature-x",
+      baseRef: "main",
+      prompt: "log",
+      adapter,
+      supervisorPid: 4321,
+      supervisorStartedAt: 1_234,
+    });
+
+    const mode = statSync(statePaths(repo, "secretlog").logPath).mode & 0o777;
+    expect(mode).toBe(0o600);
   });
 });

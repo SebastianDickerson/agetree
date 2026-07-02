@@ -81,7 +81,8 @@ export async function runLaneSupervisor(opts: RunSupervisorOptions): Promise<Lan
   });
   writeLaneRecordAtomic(opts.repoRoot, running);
 
-  const log = createWriteStream(paths.logPath, { flags: "a" });
+  // Logs can contain secrets/prompts — keep them owner-only.
+  const log = createWriteStream(paths.logPath, { flags: "a", mode: 0o600 });
   let result: LaneResult;
   try {
     result = await runLane(opts.adapter, {
@@ -95,9 +96,22 @@ export async function runLaneSupervisor(opts: RunSupervisorOptions): Promise<Lan
     await new Promise<void>((resolve) => log.end(resolve));
   }
 
-  const filesChanged = await readFilesChanged(opts.worktreePath);
-  const commit = await applyCommitPolicy(opts, result, filesChanged);
-  const reason = commit.outcome === "error" ? "auto-commit failed" : undefined;
+  // The supervisor must ALWAYS reach a terminal record. If git bookkeeping
+  // (files-changed / merge-base / auto-commit) throws after the agent ran,
+  // mark the lane failed with a reason and keep the dirty worktree, rather
+  // than rejecting and leaving a stuck `running` record.
+  let filesChanged: FilesChanged = { count: 0, files: [], truncated: false };
+  let commit: CommitPayload;
+  let reason: string | undefined;
+  try {
+    filesChanged = await readFilesChanged(opts.worktreePath);
+    commit = await applyCommitPolicy(opts, result, filesChanged);
+    reason = commit.outcome === "error" ? "auto-commit failed" : undefined;
+  } catch (error) {
+    commit = { outcome: "error" };
+    reason = `auto-commit bookkeeping failed: ${errorMessage(error)}`;
+  }
+
   const terminal = agentExit(running, {
     now: now(),
     result,
@@ -198,4 +212,8 @@ function readFileIfExists(path: string): string {
 
 function firstLine(text: string): string {
   return text.split("\n", 1)[0]?.trim() ?? "";
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
