@@ -11,7 +11,7 @@
  * and output-mode logic can be unit-tested without spawning a subprocess.
  */
 
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import type { Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { createEngine, type Engine } from "./engine.ts";
@@ -35,6 +35,30 @@ export function slugify(text: string): string {
 export function deriveLaneName(branch: string): string {
   const stripped = branch.startsWith("agetree/") ? branch.slice("agetree/".length) : branch;
   return stripped.replace(/\//g, "-");
+}
+
+export type PromptSource = {
+  /** Inline prompt text (`--prompt`). */
+  prompt?: string;
+  /** Path to a prompt file (`--prompt-file`); `-` reads stdin. */
+  promptFile?: string;
+};
+
+/**
+ * Resolve the headless prompt from `--prompt` or `--prompt-file` (mutually
+ * exclusive; `-` reads stdin). Exactly one must be provided.
+ */
+export async function resolvePrompt(source: PromptSource): Promise<string> {
+  if (source.prompt !== undefined && source.promptFile !== undefined) {
+    throw new Error("--prompt and --prompt-file are mutually exclusive");
+  }
+  if (source.prompt !== undefined) return source.prompt;
+  if (source.promptFile !== undefined) {
+    return source.promptFile === "-"
+      ? readFileSync(0, "utf8")
+      : readFileSync(source.promptFile, "utf8");
+  }
+  throw new Error("run requires --prompt or --prompt-file");
 }
 
 export type AutoNameOptions = {

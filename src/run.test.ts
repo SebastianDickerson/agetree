@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { LaneRecord } from "./lane-state.ts";
-import { autoName, formatOutput } from "./run.ts";
+import { autoName, formatOutput, resolvePrompt } from "./run.ts";
 
 function doneRecord(): LaneRecord {
   return {
@@ -41,6 +44,29 @@ describe("autoName", () => {
   it("prefers --name over the prompt for the slug", () => {
     const result = autoName({ name: "Nice Slug", prompt: "ignored prompt", now: () => 0 });
     expect(result.branch).toBe("agetree/nice-slug-0");
+  });
+});
+
+describe("resolvePrompt", () => {
+  it("returns an inline --prompt verbatim", async () => {
+    expect(await resolvePrompt({ prompt: "do the thing" })).toBe("do the thing");
+  });
+
+  it("reads --prompt-file from disk", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "agetree-prompt-"));
+    const file = join(dir, "task.md");
+    writeFileSync(file, "task from a file\n");
+    expect(await resolvePrompt({ promptFile: file })).toBe("task from a file\n");
+  });
+
+  it("rejects when neither --prompt nor --prompt-file is given", async () => {
+    await expect(resolvePrompt({})).rejects.toThrow(/--prompt/);
+  });
+
+  it("rejects when both --prompt and --prompt-file are given", async () => {
+    await expect(resolvePrompt({ prompt: "a", promptFile: "b" })).rejects.toThrow(
+      /mutually exclusive/i,
+    );
   });
 });
 
