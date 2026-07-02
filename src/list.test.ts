@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { LaneRecord, Status } from "./lane-state.ts";
-import { listLanes } from "./list.ts";
+import { formatLanesJson, formatLanesTable, listLanes, type LaneRow } from "./list.ts";
 
 /** A running lane record with sensible defaults; override per test. */
 function runningRecord(over: Partial<LaneRecord> = {}): LaneRecord {
@@ -155,5 +155,113 @@ describe("listLanes ordering", () => {
       "agetree/zeta",
       "mid-interactive",
     ]);
+  });
+});
+
+function doneRow(over: Partial<LaneRecord> = {}): LaneRow {
+  return {
+    kind: "lane",
+    orphaned: false,
+    record: {
+      name: "feature-x",
+      branch: "agetree/feature-x",
+      adapter: "claude",
+      prompt: "do x",
+      supervisorPid: 4321,
+      supervisorStartedAt: 1_000,
+      status: "done",
+      startedAt: 10_000,
+      endedAt: 22_400,
+      logPath: ".agetree/logs/feature-x.log",
+      payload: {
+        exitCode: 0,
+        isError: false,
+        finalMessage: "done x",
+        commit: { outcome: "committed", sha: "d4e5f6a", baseSha: "a1b2c3d" },
+        filesChanged: { count: 3, files: ["src/a.ts"], truncated: false },
+      },
+      ...over,
+    },
+  };
+}
+
+describe("formatLanesJson", () => {
+  it("emits a newline-terminated JSON array of public records with supervisor plumbing stripped", () => {
+    const out = formatLanesJson([doneRow()]);
+
+    expect(out.endsWith("\n")).toBe(true);
+    expect(out.trimEnd().split("\n")).toHaveLength(1); // single line: one array
+
+    const arr = JSON.parse(out);
+    expect(Array.isArray(arr)).toBe(true);
+    expect(arr[0]).toMatchObject({
+      name: "feature-x",
+      branch: "agetree/feature-x",
+      status: "done",
+      adapter: "claude",
+      orphaned: false,
+    });
+    expect(arr[0]).not.toHaveProperty("supervisorPid");
+    expect(arr[0]).not.toHaveProperty("supervisorStartedAt");
+  });
+
+  it("carries the derived orphaned flag into the public record", () => {
+    const arr = JSON.parse(formatLanesJson([{ ...doneRow(), orphaned: true }]));
+    expect(arr[0].orphaned).toBe(true);
+  });
+
+  it("emits interactive worktrees as a minimal shape marked interactive", () => {
+    const arr = JSON.parse(
+      formatLanesJson([
+        { kind: "interactive", name: "ui-polish", branch: "ui-polish", path: "/wt/ui-polish" },
+      ]),
+    );
+    expect(arr[0]).toEqual({ name: "ui-polish", branch: "ui-polish", status: "interactive" });
+  });
+
+  it("emits an empty array (still newline-terminated) when there are no lanes", () => {
+    expect(formatLanesJson([])).toBe("[]\n");
+  });
+});
+
+describe("formatLanesTable", () => {
+  it("projects a done lane: glyph, status, name, branch, adapter and duration", () => {
+    const out = formatLanesTable([doneRow()]);
+    expect(out).toContain("✓");
+    expect(out).toContain("done");
+    expect(out).toContain("feature-x");
+    expect(out).toContain("agetree/feature-x");
+    expect(out).toContain("claude");
+    expect(out).toContain("12.4s"); // 22400 - 10000 = 12400ms
+  });
+
+  it("shows elapsed age for a running lane using the injected now", () => {
+    const running = { ...doneRow({ status: "running", endedAt: undefined, payload: null }) };
+    const out = formatLanesTable([running], { now: () => 100_000 }); // 100000 - 10000 = 90000ms
+    expect(out).toContain("…");
+    expect(out).toContain("1m30s");
+  });
+
+  it("notes an orphaned lane", () => {
+    const out = formatLanesTable([{ ...doneRow(), orphaned: true }]);
+    expect(out).toContain("orphaned");
+  });
+
+  it("marks an interactive worktree with an interactive note and no adapter/duration", () => {
+    const out = formatLanesTable([
+      { kind: "interactive", name: "ui-polish", branch: "ui-polish", path: "/wt/ui" },
+    ]);
+    expect(out).toContain("ui-polish");
+    expect(out).toContain("interactive");
+  });
+
+  it("prints a clear message when there are no lanes", () => {
+    expect(formatLanesTable([])).toBe("no lanes\n");
+  });
+
+  it("humanizes a multi-hour duration compactly", () => {
+    // startedAt 0, endedAt 3_720_000ms = 62 minutes → 1h02m
+    const out = formatLanesTable([doneRow({ startedAt: 0, endedAt: 3_720_000 })]);
+    expect(out).toContain("1h02m");
   });
 });

@@ -15,7 +15,7 @@
 import { defaultWorktreeReader, type WorktreeReader } from "./engine.ts";
 import { reconcile, type LaneRecord } from "./lane-state.ts";
 import { listLaneNames, readLaneRecord } from "./lane-store.ts";
-import { deriveLaneName, processAlive } from "./run.ts";
+import { deriveLaneName, GLYPH, processAlive, toPublicRecord } from "./run.ts";
 
 /** Display marker for a worktree that has no lane record (a human/agent sits in it). */
 export const INTERACTIVE = "interactive";
@@ -90,4 +90,115 @@ export async function listLanes(opts: ListLanesOptions): Promise<LaneView[]> {
 
 function branchOf(view: LaneView): string {
   return view.kind === "lane" ? view.record.branch : view.branch;
+}
+
+// ── Output shaping ──────────────────────────────────────────────────────────
+
+/** Public projection of one view row: a public lane record or a minimal interactive shape. */
+function toPublicView(view: LaneView): Record<string, unknown> {
+  if (view.kind === "lane") return toPublicRecord(view.record, view.orphaned);
+  return { name: view.name, branch: view.branch, status: INTERACTIVE };
+}
+
+/**
+ * `--json`: a newline-terminated JSON ARRAY of public records (supervisor
+ * plumbing stripped via `toPublicRecord`, derived `orphaned` included);
+ * interactive worktrees as a minimal `{name,branch,status:"interactive"}` shape.
+ * stdout carries only this array.
+ */
+export function formatLanesJson(views: LaneView[]): string {
+  return `${JSON.stringify(views.map(toPublicView))}\n`;
+}
+
+/** Interactive rows sort/display with a dimmed marker glyph. */
+const INTERACTIVE_GLYPH = "·";
+
+type Columns = {
+  glyph: string;
+  status: string;
+  name: string;
+  branch: string;
+  adapter: string;
+  age: string;
+  note: string;
+};
+
+/** Project one view row into table columns (a pure projection of the same data). */
+function toColumns(view: LaneView, now: number): Columns {
+  if (view.kind === "interactive") {
+    return {
+      glyph: INTERACTIVE_GLYPH,
+      status: INTERACTIVE,
+      name: view.name,
+      branch: view.branch,
+      adapter: "—",
+      age: "—",
+      note: "interactive (no lane record)",
+    };
+  }
+  const { record, orphaned } = view;
+  const elapsed =
+    record.endedAt !== undefined ? record.endedAt - record.startedAt : now - record.startedAt;
+  return {
+    glyph: GLYPH[record.status] ?? "…",
+    status: record.status,
+    name: record.name,
+    branch: record.branch,
+    adapter: record.adapter,
+    age: formatDuration(elapsed),
+    note: orphaned ? "orphaned (worktree removed)" : "",
+  };
+}
+
+/**
+ * Human table: one row per lane (glyph · status · name · branch · adapter ·
+ * age/duration · note). A pure projection of the same views the JSON array
+ * uses — no separate schema. `now` is injectable so a running lane's elapsed
+ * age is deterministic in tests.
+ */
+export function formatLanesTable(views: LaneView[], opts: { now?: () => number } = {}): string {
+  if (views.length === 0) return "no lanes\n";
+  const now = (opts.now ?? Date.now)();
+  const rows = views.map((v) => toColumns(v, now));
+
+  const w = {
+    glyph: maxWidth(rows, "glyph"),
+    status: maxWidth(rows, "status"),
+    name: maxWidth(rows, "name"),
+    branch: maxWidth(rows, "branch"),
+    adapter: maxWidth(rows, "adapter"),
+    age: maxWidth(rows, "age"),
+  };
+
+  return rows
+    .map((r) => {
+      const cells = [
+        r.glyph.padEnd(w.glyph),
+        r.status.padEnd(w.status),
+        r.name.padEnd(w.name),
+        r.branch.padEnd(w.branch),
+        r.adapter.padEnd(w.adapter),
+        r.age.padStart(w.age),
+      ];
+      if (r.note) cells.push(r.note);
+      return `${cells.join("  ").trimEnd()}\n`;
+    })
+    .join("");
+}
+
+function maxWidth(rows: Columns[], key: keyof Columns): number {
+  return rows.reduce((m, r) => Math.max(m, r[key].length), 0);
+}
+
+/** Humanize a duration in ms: "12.4s", "1m30s", "1h02m". */
+function formatDuration(ms: number): string {
+  const clamped = ms < 0 ? 0 : ms;
+  const seconds = clamped / 1000;
+  if (seconds < 60) return `${seconds.toFixed(1)}s`;
+  const totalMinutes = Math.floor(seconds / 60);
+  if (totalMinutes < 60) {
+    return `${totalMinutes}m${String(Math.floor(seconds % 60)).padStart(2, "0")}s`;
+  }
+  const hours = Math.floor(totalMinutes / 60);
+  return `${hours}h${String(totalMinutes % 60).padStart(2, "0")}m`;
 }
