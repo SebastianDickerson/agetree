@@ -16,6 +16,7 @@
 
 import { spawn } from "node:child_process";
 import { accessSync, constants } from "node:fs";
+import type { Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 
 /** Invoke the Bash engine with an argv array; resolve its exit code. */
@@ -52,6 +53,12 @@ export type EngineOptions = {
   run?: EngineRunner;
   /** Override the git worktree reader (tests inject a fake). */
   listWorktrees?: WorktreeReader;
+  /**
+   * When set, engine stdout+stderr are piped to this sink instead of inherited.
+   * The headless `run --prompt` path uses this so engine `new` progress never
+   * reaches agetree's stdout (which is reserved for the single JSON object).
+   */
+  redirectEngineOutput?: Writable;
 };
 
 const DEFAULT_ENGINE_PATH = fileURLToPath(new URL("../agent-worktree.sh", import.meta.url));
@@ -59,7 +66,7 @@ const DEFAULT_ENGINE_PATH = fileURLToPath(new URL("../agent-worktree.sh", import
 export function createEngine(options: EngineOptions = {}): Engine {
   const enginePath = options.enginePath ?? DEFAULT_ENGINE_PATH;
   const cwd = options.cwd ?? process.cwd();
-  const run = options.run ?? defaultRunner(enginePath, cwd);
+  const run = options.run ?? defaultRunner(enginePath, cwd, options.redirectEngineOutput);
   const listWorktrees = options.listWorktrees ?? defaultWorktreeReader;
 
   return {
@@ -98,11 +105,13 @@ export function createEngine(options: EngineOptions = {}): Engine {
 }
 
 /**
- * Default runner: spawn the Bash engine with inherited stdio (so interactive
- * prompts, dev servers, and merge conflicts behave exactly like the script),
- * failing fast if the engine is missing or not executable.
+ * Default runner: spawn the Bash engine, failing fast if it is missing or not
+ * executable. Normally uses inherited stdio (so interactive prompts, dev
+ * servers, and merge conflicts behave exactly like the script). When a
+ * `redirectTo` sink is given (the headless path), stdout+stderr are piped to it
+ * instead so nothing leaks to agetree's own stdout.
  */
-function defaultRunner(enginePath: string, cwd: string): EngineRunner {
+function defaultRunner(enginePath: string, cwd: string, redirectTo?: Writable): EngineRunner {
   return (cmd, args) =>
     new Promise((resolve, reject) => {
       try {
@@ -111,7 +120,14 @@ function defaultRunner(enginePath: string, cwd: string): EngineRunner {
         reject(new Error(`agetree: engine not found or not executable at ${enginePath}`));
         return;
       }
-      const child = spawn(cmd, args, { cwd, stdio: "inherit" });
+      const child = spawn(cmd, args, {
+        cwd,
+        stdio: redirectTo ? ["inherit", "pipe", "pipe"] : "inherit",
+      });
+      if (redirectTo) {
+        child.stdout?.pipe(redirectTo, { end: false });
+        child.stderr?.pipe(redirectTo, { end: false });
+      }
       child.on("error", reject);
       child.on("close", (code) => resolve(code ?? -1));
     });

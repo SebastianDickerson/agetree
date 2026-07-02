@@ -1,4 +1,8 @@
 import { describe, expect, it } from "vitest";
+import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { PassThrough } from "node:stream";
 import { createEngine, type EngineRunner, type WorktreeReader } from "./engine.ts";
 
 type Call = { cmd: string; args: string[] };
@@ -117,6 +121,31 @@ describe("engine delegation argv", () => {
     await engine.remove("old-lane");
 
     expect(calls).toEqual([{ cmd: "/repo/agent-worktree.sh", args: ["rm", "old-lane"] }]);
+  });
+});
+
+describe("engine output redirection (headless path)", () => {
+  it("routes engine stdout+stderr to the given sink instead of inheriting to stdout", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "agetree-engine-"));
+    const script = join(dir, "fake-engine.sh");
+    writeFileSync(script, "#!/bin/sh\necho engine-stdout\necho engine-stderr >&2\nexit 7\n");
+    chmodSync(script, 0o755);
+
+    const sink = new PassThrough();
+    let captured = "";
+    sink.on("data", (d) => (captured += d));
+
+    const engine = createEngine({
+      enginePath: script,
+      cwd: dir,
+      redirectEngineOutput: sink,
+    });
+
+    const code = await engine.runInteractive("whatever");
+
+    expect(code).toBe(7);
+    expect(captured).toContain("engine-stdout");
+    expect(captured).toContain("engine-stderr");
   });
 });
 
