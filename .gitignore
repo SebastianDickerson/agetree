@@ -1,0 +1,22 @@
+# agetree runtime state — lane metadata + agent logs (may contain secrets/prompts)
+.agetree/
+
+# scratch agent settings files (permission-bypass configs)
+*.agetree-settings.json
+
+# secrets / env
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+id_rsa
+id_ed25519
+
+# node / typescript
+node_modules/
+dist/
+*.tsbuildinfo
+
+# os / editor
+.DS_Store
