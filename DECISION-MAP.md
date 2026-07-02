@@ -27,7 +27,9 @@ then merge their work back safely. Agents themselves can spawn lanes and delegat
   state, and the agent-facing interface. Shells out to the worktree engine.
 - **Adapter** — a thin per-CLI implementation of "run this agent headless, give me its
   final message + exit code" (Claude Code first-class, Amp second).
-- **Payload** — the structured result a finished lane yields.
+- **Payload** — the outcome sub-object of a lane record: what the lane *produced*
+  (git facts + the agent's result), as opposed to its identity/lifecycle. The whole
+  reconciled record (identity + `payload`) is what `run --wait --json` prints.
 
 ---
 
@@ -162,7 +164,7 @@ Asset: `prototypes/lane-state/` (pure `lane-state.mjs` + throwaway TUI + `NOTES.
 ## result-payload: Exact Shape Of The Payload
 
 Blocked by: agent-adapter
-Status: open
+Status: resolved
 Type: Grilling
 
 ### Question
@@ -174,7 +176,104 @@ agent is expected to consume it. Depends on what each adapter can actually emit.
 
 ### Answer
 
-<open>
+Resolved by grilling. The payload fuses three sources: the lane record (`lane-state`),
+the adapter `LaneResult` (`agent-adapter`), and git facts from the auto-commit step.
+
+- **Consumer** — **parent-agent-first**. The JSON object is the canonical artifact
+  (function-call semantics for a lane); the human view is a *projection* of it, never a
+  separate schema. One source of truth, no drift.
+- **One object, two layers** — `run --wait`/`--json` prints the **whole reconciled lane
+  record** (not a bespoke envelope). Top-level = **identity/lifecycle**; nested `payload`
+  = **outcome** (git facts + agent result). So `cat .agetree/lanes/<name>.json` ≈ what
+  `--wait` printed, and there's no parallel shape to keep in sync.
+- **Shape**:
+
+  ```jsonc
+  {
+    "name": "feature-x",              // identity/lifecycle (lane record)
+    "branch": "agetree/feature-x",
+    "status": "done",                 // done | failed | stale | timed-out | running
+    "orphaned": false,                // derived flag (worktree rm'd)
+    "adapter": "claude",              // which CLI drove it — promoted to top-level
+    "prompt": "…",                    // kept, so a fan-out parent can correlate
+    "startedAt": 1719900000000,
+    "endedAt":   1719900012400,
+    "logPath": ".agetree/logs/feature-x.log",
+    "payload": {                      // outcome sub-object
+      "exitCode": 0,
+      "isError": false,              // exitCode !== 0 || result.is_error — diagnostic only
+      "finalMessage": "…",           // agent's last message, ALWAYS emitted whole
+      "reason": null,                // short string on every non-`done` status; omitted on done
+      "commit": {
+        "outcome": "committed",      // committed | nothing | skipped | error
+        "sha":     "d4e5f6a",        // branch head after auto-commit
+        "baseSha": "a1b2c3d"         // merge-base with base branch → review range baseSha..sha
+      },
+      "filesChanged": { "count": 3, "files": ["src/a.ts", "…"], "truncated": false },
+      "sessionId": "…",              // adapter LaneResult
+      "numTurns": 4,
+      "durationMs": 12400,
+      "costUsd": 0.031               // Claude only; OMITTED for Amp
+    }
+  }
+  ```
+
+  `supervisorPid` stays on disk but is **omitted** from output (internal plumbing).
+
+- **`status` is the single success signal** — `done` ⇒ mergeable branch at `commit.sha`;
+  any other terminal status ⇒ not success. `exitCode`/`isError` are demoted to *why*, never
+  the branch condition (because `status` encodes the fuller policy: `exit 0 + commit error
+  → failed`). `payload.reason` explains every non-`done` outcome in one read (`"agent
+  exited 2"`, `"auto-commit failed: …"`, `"supervisor died"`, `"exceeded max run budget"`).
+  No separate `ok` boolean.
+- **commit sha(s)** — head + `baseSha` range, not a list. `baseSha..sha` is the exact
+  review/diff handle whether the agent made zero own commits (just the auto-commit) or
+  several; intermediate shas are recoverable via `git log baseSha..sha`. On
+  `nothing`, `sha === baseSha`; on `skipped`/`error`, both omitted (dirty worktree kept).
+- **filesChanged** — `{ count, files, truncated }`. Precomputed (parent avoids re-shelling
+  to git) but capped at **50** paths: `count` is always the true total, `truncated:true`
+  when the list was capped (parent falls back to the range). No per-file status/line counts
+  in v1 — derivable from the range.
+- **finalMessage** — **never truncated in JSON** (it's the answer the parent waited for; only
+  the last assistant message, bounded in practice; full transcript at `logPath`). Empty
+  string when the agent only wrote files — parent leans on `filesChanged` + `logPath`.
+- **Emission contract**:
+  - `--json` and `--wait` are **orthogonal**. `--wait --json` → block, print terminal
+    record as JSON. `--wait` → block, human projection. `--json` (no wait) → return now,
+    print the `running` record as JSON. Neither → human one-liner ("lane started, pid …").
+  - **stdout carries only the JSON** (one newline-terminated object); all agetree
+    progress/diagnostics go to **stderr**, so a parent pipes stdout straight to a parser.
+  - agetree's **own exit code mirrors lane success** under `--wait`: `0` = `done`,
+    `1` = non-`done` terminal, `2` = agetree operational error (bad flags/engine failure).
+    Without `--wait`, exit `0` just means "spawned OK".
+- **Schema stability** — **no `schemaVersion` field** in v1; **additive-only discipline**
+  (fields only added, never renamed/removed; skill reads defensively). **Omit-don't-null**
+  for inapplicable optional fields (`costUsd` on Amp, `commit.sha`/`baseSha` on
+  `skipped`/`error`, `reason` on `done`). Fixed **always-present core** a parent can rely on
+  unconditionally: `name, branch, status, adapter, payload.exitCode, payload.finalMessage`.
+- **Human projection** (this ticket owns the single-lane `run --wait` view; the `ls` table
+  is `cli-surface`/`lane-state`). Pure projection of the JSON — glyph from `status`
+  (`✓`/`✗`/`…`), header line, key/value lines, then the whole `finalMessage`:
+
+  ```
+  ✓ done  lane feature-x · claude · 12.4s
+    branch  agetree/feature-x   (3 files changed)
+    range   a1b2c3d..d4e5f6a
+    log     .agetree/logs/feature-x.log
+
+    <finalMessage, in full>
+  ```
+
+  Failure leads with `reason` and drops the commit/range/files lines. Commit lines shown
+  only when `commit.outcome === "committed"`.
+
+- **Hands off** — this locks the JSON contract `cli-surface` must expose (`--json`/`--wait`
+  orthogonality, stdout=JSON-only, exit-code 0/1/2) and that `skill-design` teaches a parent
+  to read (`status` first, then `finalMessage`/`filesChanged`/`commit`). The persisted
+  `payload` blob in `lane-state` should adopt these exact fields (its current placeholder
+  is `{exitCode, commit, filesChanged, finalMessage}` — extend with `isError, reason,
+  baseSha, filesChanged.{files,truncated}` and the adapter metadata). `filesChanged` +
+  `baseSha` are computed by the auto-commit step, not the adapter.
 
 ## cli-surface: Command & Flag Design
 
