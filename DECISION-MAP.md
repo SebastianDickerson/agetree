@@ -541,7 +541,7 @@ lane GC stay outside this module.
 ## skill-design: The Agent-Facing "When To Fan Out" Skill
 
 Blocked by: cli-surface, result-payload
-Status: open
+Status: resolved
 Type: Grilling
 
 ### Question
@@ -553,12 +553,95 @@ surface. Reuse `/writing-great-skills`.
 
 ### Answer
 
-<open>
+Resolved by grilling. The skill is the agent-facing half of the `cli-surface` +
+`result-payload` contract: it teaches *judgment* (when to delegate) and *protocol* (how
+to invoke + read back), while deferring the exhaustive flag list to `agetree --help`.
+
+- **Packaging & identity** — A single, instructions-only `SKILL.md` shipped **in-repo**
+  at `skills/delegating-to-lanes/SKILL.md` so it versions with the CLI (symlink/install
+  into `~/.agents/skills/`). Name (gerund) **`delegating-to-lanes`**. No scripts, no MCP.
+  Description names concrete triggers ("fan out", "run subtasks in parallel", "delegate to
+  a background agent") for discovery. Target ~150 lines.
+
+- **Trigger — the "worth it" test** — Fan out only when the subtask is **all of**:
+  (1) **independent** (no mid-task back-and-forth with the parent); (2) **self-containable**
+  (parent can write a complete prompt a fresh, history-less agent can finish);
+  (3) **branch-worthy** (yields a mergeable branch, not a one-line answer);
+  (4) **isolated/parallel** (belongs on its own risky/experimental branch, or is one of
+  several such subtasks runnable at once). **Headline trigger**: "I'm about to do N
+  independent, branch-worthy changes that don't depend on each other → fan them out in
+  parallel." Secondary: "this one change is experimental/throwaway → give it its own lane."
+
+- **Anti-trigger — do it yourself instead** — (1) **trivial work** (single read/grep/
+  one-line edit/answer — lane overhead dwarfs it); (2) **sequential/dependent work**
+  (step B needs step A's in-flight result, or you'll iterate — lanes are function calls,
+  not conversations); (3) **shared-context work** (depends on uncommitted state or context
+  expensive to serialize — a child sees only its fresh worktree + prompt); (4) **unbounded
+  exploration** ("figure out what to do" — fan out *execution* of a decided plan, not the
+  deciding). Unifying rule: **if writing the self-contained prompt costs more than doing
+  the work, don't fan out.**
+
+- **Recursion & width guardrails** — (1) **Depth cap 2 via `AGETREE_DEPTH`**: every lane
+  inherits `parent + 1` (unset = 0 at the human top level); the skill reads it and, if
+  `≥ 2`, does the work inline. Recursion stays *possible* (map's fan-out goal) but bounded:
+  human 0→1, child 1→2, depth-2 agents are leaves. (2) **Width cap ~5** lanes from one
+  agent at once; batch beyond that. (3) **Soft rule**: a child only re-fans if its own
+  subtask genuinely splits again. NOTE: the skill can only *read* `AGETREE_DEPTH` — the
+  supervisor must **inject** it into each lane's env (handed off below).
+
+- **Invocation recipe** — Two canonical, drilled patterns:
+  - **Single delegation (blocking function call):**
+    `agetree run --agent claude --base main --wait --json --prompt "<self-contained task>"`
+    — always `--wait --json`; the skill warns that `--json` *without* `--wait` returns a
+    `running` record, not a result.
+  - **Parallel fan-out:** spawn each lane **without** `--wait` (returns right after spawn),
+    collect lane names, then **poll `agetree ls --json`** until all are terminal and read
+    each final record (from the poll or a follow-up `--wait`). This is how a single-threaded
+    agent shell drives many lanes at once.
+  - **Prompt authoring is the emphasized skill**: prompts must be **self-contained** (goal,
+    relevant file paths, conventions/constraints, crisp definition of done) because the child
+    has zero conversation history. Prefer `--prompt-file <path>` (or `-` for stdin) for long
+    prompts.
+
+- **Reading the payload — status-first protocol** (mirrors `result-payload`, no drift):
+  (1) **Read `status` first — the single success signal.** `done` ⇒ mergeable branch at
+  `payload.commit.sha`; any other terminal value ⇒ not success, read `payload.reason`.
+  Explicitly **do not** branch on `exitCode`/`isError` (diagnostics only). (2) Then read as
+  needed: `payload.finalMessage` (the answer, always whole), `payload.filesChanged`
+  (`{count,files,truncated}`; on `truncated`, fall back to the `baseSha..sha` range),
+  `payload.commit.{sha,baseSha}` (the diff handle). (3) Rely only on the always-present
+  **core**: `name, branch, status, adapter, payload.exitCode, payload.finalMessage`; treat
+  everything else as **omit-don't-null** and **read defensively** (matching additive-only,
+  no-`schemaVersion` discipline). (4) On failure: report `reason`, optionally inspect
+  `logPath` / the kept dirty worktree — **do not silently retry in a loop**.
+
+- **Merge-back responsibility** — **Children return branches, never merge.** A `done`
+  lane's deliverable is a *reviewable* branch at `commit.sha`; the parent surfaces
+  `branch` + range + `finalMessage` upward. Merging is a deliberate act via
+  `agetree merge <target> <branch> [--rm]`. **Only the top-level integrator (depth 0)**,
+  when it explicitly owns integration, may merge — **sequentially, one at a time**,
+  checking each result, after all lanes are `done`. This funnels a fan-out tree back to a
+  single integrator and avoids concurrent merges into the same target.
+
+- **How it references cli-surface** — **Inline the minimum, defer the rest to `--help`.**
+  Hard-code only the **two recipes** and the **always-present payload core** (the stable
+  contract this ticket locks). For the full flag/verb list (adapters, `--base`,
+  `--timeout`, `--prompt-file`, model flags, `merge`/`rm`/`logs`) say "run
+  `agetree run --help` / `agetree --help`" rather than duplicating `cli-surface` (keeps the
+  skill from rotting). Declare the **JSON authoritative over prose**: if the skill's text
+  and a returned record ever disagree, trust the JSON.
+
+- **Hands off** — Requires a runtime change the skill itself cannot make: **the per-lane
+  supervisor must inject `AGETREE_DEPTH` (= parent value + 1, default 0) into the agent's
+  environment** so the depth guardrail works. This lands in the supervisor spawn path owned
+  by `lane-state` (resolved) and executed across the seam by `ts-bash-boundary` (in-progress)
+  — flag it there. No other new tickets: the skill consumes the already-locked `cli-surface`
+  emission contract and `result-payload` core fields unchanged.
 
 ## lane-gc: Pruning Terminal Lanes & Killing Timed-Out Processes
 
 Blocked by: cli-surface
-Status: open
+Status: in-progress
 Type: Grilling
 
 ### Question
