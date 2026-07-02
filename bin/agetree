@@ -1,0 +1,6 @@
+#!/bin/sh
+# agetree launcher — runs the TypeScript CLI via Node's type stripping.
+# Resolves the repo root from this script's location so it works via the
+# package `bin` symlink or a direct `./bin/agetree` invocation.
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+exec node --experimental-strip-types "$ROOT/src/cli.ts" "$@"

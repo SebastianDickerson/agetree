@@ -4,6 +4,9 @@
   "private": true,
   "type": "module",
   "description": "Personal sandcastle-style orchestrator: run coding agents in isolated git-worktree lanes.",
+  "bin": {
+    "agetree": "bin/agetree"
+  },
   "scripts": {
     "test": "vitest run",
     "test:watch": "vitest",
