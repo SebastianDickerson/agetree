@@ -9,6 +9,7 @@
  */
 
 import { spawn } from "node:child_process";
+import type { Writable } from "node:stream";
 
 /** What a lane needs to know to drive an agent. */
 export type RunOptions = {
@@ -17,6 +18,10 @@ export type RunOptions = {
   /** Real coding lanes need this (permission bypass); trivial demos do not. */
   allowAllTools: boolean;
   model?: string;
+  /** Extra environment injected by the supervisor, e.g. AGETREE_DEPTH. */
+  env?: NodeJS.ProcessEnv;
+  /** Optional combined stdout/stderr sink for lane logs. */
+  log?: Writable;
 };
 
 /** A plain argv (+ env) so a future container executor can wrap it untouched. */
@@ -64,13 +69,19 @@ export function runLane(adapter: Adapter, opts: RunOptions): Promise<LaneResult>
   return new Promise((resolve, reject) => {
     const child = spawn(cmd, args, {
       cwd: opts.cwd,
-      env: { ...process.env, ...env },
+      env: { ...process.env, ...env, ...opts.env },
       stdio: ["ignore", "pipe", "pipe"],
     });
     let stdout = "";
     let stderr = "";
-    child.stdout.on("data", (d) => (stdout += d));
-    child.stderr.on("data", (d) => (stderr += d));
+    child.stdout.on("data", (d) => {
+      stdout += d;
+      opts.log?.write(d);
+    });
+    child.stderr.on("data", (d) => {
+      stderr += d;
+      opts.log?.write(d);
+    });
     child.on("error", reject);
     child.on("close", (code) => {
       try {

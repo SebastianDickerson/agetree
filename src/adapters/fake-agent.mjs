@@ -14,6 +14,7 @@
  *     finalMessage?: string,
  *     exitCode?: number,
  *     writeFiles?: { path: string, content: string }[],
+ *     writeEnv?: { name: string, path: string }[],
  *     stderr?: string,
  *     isError?: boolean,
  *     sessionId?: string,
@@ -40,6 +41,12 @@ for (const file of spec.writeFiles ?? []) {
   const target = isAbsolute(file.path) ? file.path : join(process.cwd(), file.path);
   mkdirSync(dirname(target), { recursive: true });
   writeFileSync(target, file.content ?? "");
+}
+
+for (const envFile of spec.writeEnv ?? []) {
+  const target = isAbsolute(envFile.path) ? envFile.path : join(process.cwd(), envFile.path);
+  mkdirSync(dirname(target), { recursive: true });
+  writeFileSync(target, process.env[envFile.name] ?? "");
 }
 
 if (spec.stderr) process.stderr.write(spec.stderr);

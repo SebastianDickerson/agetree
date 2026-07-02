@@ -18,11 +18,15 @@ const FAKE_AGENT = fileURLToPath(new URL("./fake-agent.mjs", import.meta.url));
 /** A file the fake agent should create in the lane worktree. */
 export type FakeFile = { path: string; content: string };
 
+/** An environment variable the fake agent should write into a file. */
+export type FakeEnvWrite = { name: string; path: string };
+
 /** The scripted behavior of a fake agent run. */
 export type FakeAgentSpec = {
   finalMessage?: string;
   exitCode?: number;
   writeFiles?: FakeFile[];
+  writeEnv?: FakeEnvWrite[];
   stderr?: string;
   isError?: boolean;
   sessionId?: string;
