@@ -278,7 +278,7 @@ the adapter `LaneResult` (`agent-adapter`), and git facts from the auto-commit s
 ## cli-surface: Command & Flag Design
 
 Blocked by: agent-adapter, lane-state, result-payload
-Status: open
+Status: resolved
 Type: Grilling
 
 ### Question
@@ -291,7 +291,103 @@ Consider `/design-an-interface` to sketch 2–3 shapes before committing.
 
 ### Answer
 
-<open>
+Resolved as a **compatibility-first façade** over the proven Bash engine. Keep
+`new/run/ls/merge/rm` as public `agetree` verbs so migration from `agent-worktree.sh` is
+mostly a command-name swap, and use prompt presence as the disambiguator:
+`agetree run <branch>` without a prompt keeps the engine's interactive dev-stack behavior;
+`agetree run [branch] --prompt ...` is the new headless orchestrator path for parent agents.
+
+### Command list
+
+- `agetree new <branch> [base]` — create an interactive lane/worktree by delegating to
+  `agent-worktree.sh new <branch> [base]`. No agent is started.
+- `agetree run <branch>` — compatibility mode for `agent-worktree.sh run <branch>`: start the
+  interactive dev stack for an existing lane/worktree.
+- `agetree run [branch] [base] --prompt <text>` — headless orchestrator mode: create/reuse a
+  lane, start the selected agent adapter in the background, write state under
+  `.agetree/lanes`, stream logs under `.agetree/logs`, and auto-commit on clean exit. If
+  `branch` is omitted, auto-name as `agetree/<slug-of-prompt>-<short-timestamp>`.
+- `agetree run [branch] [base] --prompt-file <path>` — same as `--prompt`, but reads the
+  prompt from a file (`-` means stdin). Exactly one of `--prompt` / `--prompt-file` selects
+  headless mode.
+- `agetree ls [--json] [--all]` — lane-centric list from `.agetree/lanes`, reconciled with
+  worktrees. Includes interactive worktrees with no lane record and marks orphaned terminal
+  records. `--json` prints an array of reconciled records.
+- `agetree logs <branch-or-lane> [-f|--follow] [--lines <n>]` — print/tail
+  `.agetree/logs/<name>.log`.
+- `agetree merge <target> [branches...] [--all] [--rm]` — delegate merge-back to the Bash
+  engine, accepting lane names or branch names. `--rm` removes successfully merged worktrees;
+  lane-record/log pruning details remain for `lane-gc`.
+- `agetree rm <branch-or-lane> [--force]` — remove a lane/worktree by delegating to the Bash
+  engine. State/log cleanup policy remains owned by `lane-gc`.
+- `agetree gc` / `agetree reap` — lifecycle-owner hook for the `lane-gc` ticket to persist
+  healed `stale`/`timed-out` statuses, kill timed-out processes, and prune old terminal lane
+  records/logs. Exact retention policy remains owned by `lane-gc`.
+- `agetree engine <new|run|ls|merge|rm> ...` — raw engine namespace, argument-compatible with
+  `agent-worktree.sh`, for scripts or humans that need exact Bash behavior/output during
+  migration. A future `agent-worktree.sh` shim can call this without changing old users.
+
+### `run` flags
+
+- Lane identity: optional positional `branch` only in headless mode; positional `[base]` kept
+  for engine compatibility; `--base <ref>` is the self-documenting equivalent for parent
+  agents; `--name <slug>` influences auto-naming when no branch is given.
+- Prompt: `--prompt <text>` or `--prompt-file <path|->`; mutually exclusive. Presence of
+  either flag selects headless mode; absence preserves `agent-worktree.sh run <branch>`.
+- Adapter: `--agent claude|amp` (default `claude`). Adapter-specific model controls stay
+  namespaced: `--claude-model <model>` and `--amp-model <model>` if/when Amp exposes an
+  equivalent. Do **not** pretend there is one portable `--model`; the CLIs diverge.
+- Escape hatch: `--adapter-arg <arg>` repeatable for expert adapter-specific argv additions.
+- Execution: background by default; `--wait` blocks until terminal/reconciled status;
+  `--timeout <duration>` sets max run budget; `--idle-timeout <duration>` is the optional
+  no-output safety net from `execution-model`.
+- Output: `--json` is orthogonal to `--wait`. Under `--json`, stdout is exactly one
+  newline-terminated JSON object and all progress/diagnostics go to stderr. With
+  `--wait --json`, the object is terminal; with `--json` alone, it is the initial `running`
+  record.
+- Exit codes: without `--wait`, `0` means spawned/tracked successfully and `2` means an
+  agetree operational error. With `--wait`: `0` = `done`, `1` = terminal non-`done`,
+  `2` = operational error.
+
+### Usage examples
+
+Human compatibility workflow:
+
+```sh
+agetree new ui-polish main
+agetree run ui-polish
+agetree ls
+agetree merge main ui-polish --rm
+```
+
+Parent-agent function-call style:
+
+```sh
+payload=$(agetree run --agent amp --prompt-file task.md --base main --wait --json)
+status=$(printf '%s' "$payload" | jq -r '.status')
+test "$status" = done
+```
+
+### Tradeoffs / risks
+
+- **Overloaded `run` is deliberate** — Prompt presence is the mode switch. This is less pure
+  than a separate `spawn` verb, but it preserves `agent-worktree.sh run <branch>` and keeps
+  the resolved parent-agent command (`agetree run --prompt ...`) short.
+- **Branch positional ambiguity** — `agetree run foo --prompt …` could mean lane name or raw
+  branch. Public commands should accept either, normalize to the lane record's canonical
+  `branch`, and always print both `name` and `branch`.
+- **Adapter flags leak provider details** — Namespaced model flags are less elegant than
+  `--model`, but they avoid a false abstraction: Claude and Amp controls are not equivalent
+  today. A later adapter can add its own namespaced options without breaking the parent-agent
+  contract.
+- **`--json` without `--wait` can surprise parents** — It returns a `running` record, not a
+  result. The skill must teach parent agents to use `--wait --json` for delegation unless
+  they intentionally want fire-and-forget.
+- **JSON contract is strict** — JSON-only stdout under `--json` is excellent for parents but
+  requires discipline: all progress, warnings, and adapter stderr must route to stderr/logs.
+- **Cleanup policy is deferred** — `rm`/`merge --rm` can remove worktrees today, but lane
+  record/log pruning remains a separate `lane-gc` decision. This avoids baking in a cleanup
+  policy before the lifecycle owner is decided.
 
 ## ts-bash-boundary: Which Responsibilities Cross The TS↔Bash Seam
 
