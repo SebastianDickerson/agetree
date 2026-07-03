@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { Writable } from "node:stream";
 import type { Engine } from "./engine.ts";
 import type { LaneRecord } from "./lane-state.ts";
+import { writeLaneRecordAtomic } from "./lane-store.ts";
 import { autoName, formatOutput, resolvePrompt, runHeadless } from "./run.ts";
 import type { SpawnProcess } from "./supervisor.ts";
 
@@ -33,6 +34,198 @@ function doneRecord(): LaneRecord {
 function sink(): Writable {
   return new Writable({ write: (_c, _e, cb) => cb() });
 }
+
+function collector(): Writable & { text: string } {
+  let text = "";
+  const stream = new Writable({
+    write(chunk, _enc, cb) {
+      text += chunk;
+      cb();
+    },
+  }) as Writable & { text: string };
+  Object.defineProperty(stream, "text", { get: () => text });
+  return stream;
+}
+
+/** A running lane record on disk, keyed to the `agetree/feature-x` lane. */
+function runningRecord(): LaneRecord {
+  return {
+    ...doneRecord(),
+    status: "running",
+    startedAt: 0,
+    endedAt: undefined,
+    payload: null,
+  };
+}
+
+/** A spawn stub that pretends to launch the detached supervisor. */
+function noopSpawn(): SpawnProcess {
+  return () => ({ pid: 4321, unref: () => {} });
+}
+
+/**
+ * A self-advancing simulated clock: each read jumps `stepMs`, so a tiny real
+ * `pollIntervalMs` translates to arbitrarily large *simulated* elapsed time.
+ * `at`/`onReach` fire a one-shot side effect once simulated time crosses `at`
+ * (used to flip a lane record to a terminal status mid-wait).
+ */
+function steppingClock(
+  stepMs: number,
+  opts?: { at: number; onReach: () => void },
+): () => number {
+  let t = 0;
+  let fired = false;
+  return () => {
+    t += stepMs;
+    if (opts && !fired && t >= opts.at) {
+      fired = true;
+      opts.onReach();
+    }
+    return t;
+  };
+}
+
+function tempRepo(): string {
+  return mkdtempSync(join(tmpdir(), "agetree-wait-"));
+}
+
+describe("runHeadless — the --wait loop (startup vs run phases)", () => {
+  it("regression: --timeout unset, lane stays running well past 60s then completes → exit 0", async () => {
+    // The reported bug: the wait loop's deadline was a hardcoded 60s, so a lane
+    // that legitimately runs longer surfaced as an operational exit 2 while it
+    // was actually still running fine.
+    const repo = tempRepo();
+    writeLaneRecordAtomic(repo, runningRecord());
+    const out = collector();
+    const now = steppingClock(5_000, {
+      at: 90_000, // long past the old 60s hardcap
+      onReach: () => writeLaneRecordAtomic(repo, doneRecord()),
+    });
+
+    const res = await runHeadless({
+      repoRoot: repo,
+      prompt: "do it",
+      branch: "agetree/feature-x",
+      engine: stubEngine(),
+      spawn: noopSpawn(),
+      now,
+      isAlive: () => true,
+      pollIntervalMs: 1,
+      wait: true,
+      json: true,
+      out,
+      err: sink(),
+    });
+
+    expect(res.exitCode).toBe(0);
+    expect(JSON.parse(out.text).status).toBe("done");
+  });
+
+  it("--timeout set, lane exceeds the budget and stays running → timed-out record, exit 1 (not exit 2)", async () => {
+    const repo = tempRepo();
+    writeLaneRecordAtomic(repo, runningRecord()); // never flips; runs forever
+    const out = collector();
+    // Budget deliberately > the old 60s hardcap so reconcile's `timed-out`
+    // classification must win over any hard deadline (old code threw at 60s).
+    const res = await runHeadless({
+      repoRoot: repo,
+      prompt: "do it",
+      branch: "agetree/feature-x",
+      engine: stubEngine(),
+      spawn: noopSpawn(),
+      now: steppingClock(5_000),
+      isAlive: () => true,
+      pollIntervalMs: 1,
+      timeoutMs: 90_000,
+      wait: true,
+      json: true,
+      out,
+      err: sink(),
+    });
+
+    expect(res.exitCode).toBe(1);
+    expect(JSON.parse(out.text).status).toBe("timed-out");
+  });
+
+  it("--timeout set, lane completes before the budget → done, exit 0", async () => {
+    const repo = tempRepo();
+    writeLaneRecordAtomic(repo, runningRecord());
+    const out = collector();
+    const now = steppingClock(5_000, {
+      at: 20_000,
+      onReach: () => writeLaneRecordAtomic(repo, doneRecord()),
+    });
+
+    const res = await runHeadless({
+      repoRoot: repo,
+      prompt: "do it",
+      branch: "agetree/feature-x",
+      engine: stubEngine(),
+      spawn: noopSpawn(),
+      now,
+      isAlive: () => true,
+      pollIntervalMs: 1,
+      timeoutMs: 90_000,
+      wait: true,
+      json: true,
+      out,
+      err: sink(),
+    });
+
+    expect(res.exitCode).toBe(0);
+    expect(JSON.parse(out.text).status).toBe("done");
+  });
+
+  it("--timeout unset, supervisor dies mid-wait → reconcile yields stale, exit 1 (no hang)", async () => {
+    const repo = tempRepo();
+    writeLaneRecordAtomic(repo, runningRecord());
+    const out = collector();
+
+    const res = await runHeadless({
+      repoRoot: repo,
+      prompt: "do it",
+      branch: "agetree/feature-x",
+      engine: stubEngine(),
+      spawn: noopSpawn(),
+      now: steppingClock(5_000),
+      isAlive: () => false, // supervisor pid is dead
+      pollIntervalMs: 1,
+      wait: true,
+      json: true,
+      out,
+      err: sink(),
+    });
+
+    expect(res.exitCode).toBe(1);
+    expect(JSON.parse(out.text).status).toBe("stale");
+  });
+
+  it("startup guard: the record never appears within the startup window → operational error, exit 2", async () => {
+    const repo = tempRepo(); // no lane record ever written
+    const out = collector();
+    const err = collector();
+
+    const res = await runHeadless({
+      repoRoot: repo,
+      prompt: "do it",
+      branch: "agetree/feature-x",
+      engine: stubEngine(),
+      spawn: noopSpawn(),
+      now: steppingClock(5_000),
+      isAlive: () => true,
+      pollIntervalMs: 1,
+      startupTimeoutMs: 10_000,
+      wait: true,
+      json: true,
+      out,
+      err,
+    });
+
+    expect(res.exitCode).toBe(2);
+    expect(out.text).toBe(""); // JSON-only stdout: nothing on operational error
+    expect(err.text).toMatch(/timed out/i);
+  });
+});
 
 /** A no-op engine whose ensureWorktree returns a fixed path (no real git). */
 function stubEngine(): Engine {

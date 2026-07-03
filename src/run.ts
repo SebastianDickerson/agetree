@@ -21,6 +21,22 @@ import { spawnDetachedSupervisor, type SpawnProcess } from "./supervisor.ts";
 
 const SLUG_MAX = 40;
 
+/**
+ * Bounded window for a lane record to first APPEAR on disk under `--wait`.
+ * If the record never shows up the supervisor died before writing `running`,
+ * which is a genuine operational error (exit 2), not a long-running lane.
+ * Injectable via `RunHeadlessOptions.startupTimeoutMs` for tests.
+ */
+export const RECORD_STARTUP_TIMEOUT_MS = 60_000;
+
+/**
+ * Grace margin (covering the poll interval + clock skew) added to the run-phase
+ * backstop deadline so that when `--timeout` is set, `reconcile()` always gets
+ * to classify an over-budget lane as `timed-out` (terminal → exit 1) *before*
+ * any hard deadline could fire (which would wrongly surface exit 2).
+ */
+export const WAIT_GRACE_MS = 3_000;
+
 /** Turn free text into a filesystem/branch-safe slug. */
 export function slugify(text: string): string {
   return text
@@ -191,6 +207,8 @@ export type RunHeadlessOptions = {
   json?: boolean;
   /** Optional run budget (ms) used to classify a `timed-out` lane while waiting. */
   timeoutMs?: number;
+  /** Bounded startup window for the record to appear; injectable for tests. */
+  startupTimeoutMs?: number;
   // ── injectables (tests / advanced callers) ──
   engine?: Engine;
   now?: () => number;
@@ -226,6 +244,7 @@ export async function runHeadless(opts: RunHeadlessOptions): Promise<RunHeadless
   const json = opts.json ?? false;
   const pollIntervalMs = opts.pollIntervalMs ?? 40;
   const isAlive = opts.isAlive ?? processAlive;
+  const startupTimeoutMs = opts.startupTimeoutMs ?? RECORD_STARTUP_TIMEOUT_MS;
 
   try {
     if (!opts.prompt) throw new Error("run --prompt requires a non-empty prompt");
@@ -266,10 +285,12 @@ export async function runHeadless(opts: RunHeadlessOptions): Promise<RunHeadless
 
     if (!wait) {
       if (json) {
+        // Wait only for the record to APPEAR (startup phase), then print the
+        // initial `running` record — bounded by the same startup constant.
         const record = await pollUntil(
           () => readLaneRecord(opts.repoRoot, name),
           (r) => r !== null,
-          { now, pollIntervalMs },
+          { now, pollIntervalMs, timeoutMs: startupTimeoutMs },
         );
         out.write(formatOutput(record, { json: true, wait: false, orphaned: false }));
       } else {
@@ -278,10 +299,25 @@ export async function runHeadless(opts: RunHeadlessOptions): Promise<RunHeadless
       return { exitCode: 0 };
     }
 
+    // Startup phase: the record must appear within a bounded window, else the
+    // supervisor died before writing `running` → operational error (exit 2).
+    await pollUntil(
+      () => readLaneRecord(opts.repoRoot, name),
+      (r) => r !== null,
+      { now, pollIntervalMs, timeoutMs: startupTimeoutMs },
+    );
+
+    // Run phase: wait for a TERMINAL status. With a run budget, `reconcile()`
+    // classifies the lane `timed-out` at `startedAt + timeoutMs` (terminal →
+    // exit 1); the only hard deadline is a backstop positioned safely after
+    // that point. With no budget, wait indefinitely — a dead supervisor is
+    // still healed into `stale` by `reconcile()`, so the loop can't hang.
+    const runTimeoutMs =
+      opts.timeoutMs !== undefined ? opts.timeoutMs + WAIT_GRACE_MS : undefined;
     const { record, orphaned } = await pollUntil(
       () => reconcileRecord(opts.repoRoot, name, worktreePath, now, isAlive, opts.timeoutMs),
       (r) => r !== null && isTerminal(r.record.status),
-      { now, pollIntervalMs },
+      { now, pollIntervalMs, timeoutMs: runTimeoutMs },
     );
     out.write(formatOutput(record, { json, wait: true, orphaned }));
     return { exitCode: record.status === STATUS.DONE ? 0 : 1 };
@@ -313,13 +349,17 @@ function reconcileRecord(
   return { record: reconciled, orphaned: flags.orphaned };
 }
 
-/** Poll `read` until `done` holds; throws (operational error) on timeout. */
+/**
+ * Poll `read` until `done` holds; throws (operational error) on timeout.
+ * An unset `timeoutMs` means no deadline — wait indefinitely (the caller must
+ * guarantee termination another way, e.g. `reconcile()` healing a stuck lane).
+ */
 async function pollUntil<T>(
   read: () => T,
   done: (value: T) => boolean,
   opts: { now: () => number; pollIntervalMs: number; timeoutMs?: number },
 ): Promise<NonNullable<T>> {
-  const deadline = opts.now() + (opts.timeoutMs ?? 60_000);
+  const deadline = opts.timeoutMs !== undefined ? opts.now() + opts.timeoutMs : Infinity;
   for (;;) {
     const value = read();
     if (done(value)) return value as NonNullable<T>;
