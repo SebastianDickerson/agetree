@@ -19,8 +19,13 @@
  */
 
 import { defaultWorktreeReader, type WorktreeReader } from "./engine.ts";
-import { reconcile, STATUS, type LaneRecord, type Status } from "./lane-state.ts";
-import { listLaneNames, readLaneRecord, writeLaneRecordAtomic } from "./lane-store.ts";
+import { isTerminal, reconcile, STATUS, type LaneRecord, type Status } from "./lane-state.ts";
+import {
+  deleteLaneArtifacts,
+  listLaneNames,
+  readLaneRecord,
+  writeLaneRecordAtomic,
+} from "./lane-store.ts";
 import { processAlive } from "./run.ts";
 
 /** Default prune window: terminal records older than 7 days age out. */
@@ -56,6 +61,10 @@ export type GcOptions = {
   dryRun?: boolean;
   /** Best-effort group-kill a `stale` lane whose process group still exists (opt-in). */
   killOrphans?: boolean;
+  /** Prune non-orphaned terminals whose `endedAt` is older than this (default 7 days). */
+  olderThanMs?: number;
+  /** Backstop: keep the N most-recent non-orphaned terminals, prune older ones regardless of age. */
+  keep?: number;
   // ── injectables (tests / advanced callers) ──
   now?: () => number;
   /** Leader liveness (`process.kill(pid, 0)`), for reconcile facts + the kill guard. */
@@ -84,6 +93,7 @@ export type GcOptions = {
   readLaneNames?: (root: string) => string[];
   readRecord?: (root: string, name: string) => LaneRecord | null;
   writeRecord?: (root: string, record: LaneRecord) => void;
+  deleteArtifacts?: (root: string, name: string) => void;
 };
 
 /** All gc seams resolved to concrete functions — passed to the per-lane helpers. */
@@ -101,6 +111,7 @@ type GcCtx = {
   maxRunMs?: number;
   readRecord: (root: string, name: string) => LaneRecord | null;
   writeRecord: (root: string, record: LaneRecord) => void;
+  deleteArtifacts: (root: string, name: string) => void;
 };
 
 /**
@@ -122,6 +133,7 @@ export async function gc(opts: GcOptions): Promise<GcSummary> {
     maxRunMs: opts.maxRunMs,
     readRecord: opts.readRecord ?? readLaneRecord,
     writeRecord: opts.writeRecord ?? writeLaneRecordAtomic,
+    deleteArtifacts: opts.deleteArtifacts ?? deleteLaneArtifacts,
   };
   const listWorktrees = opts.listWorktrees ?? defaultWorktreeReader;
   const readNames = opts.readLaneNames ?? listLaneNames;
@@ -154,7 +166,75 @@ export async function gc(opts: GcOptions): Promise<GcSummary> {
     healLane(ctx, name, record, reconciled, summary);
   }
 
+  // ── Pass 2: prune (terminal-only, `.agetree` artifacts only) ──
+  // Re-read from disk so records just healed into a terminal status this pass
+  // are considered (and never a worktree/branch — that stays the engine's job).
+  prune(ctx, readNames(opts.repoRoot), worktrees, opts.olderThanMs, opts.keep, summary);
+
   return summary;
+}
+
+/**
+ * Delete the `.agetree/` artifacts of eligible terminal records:
+ *  - `orphaned` terminals (worktree already gone) go immediately, ignoring age —
+ *    the record + log are pure litter.
+ *  - non-orphaned terminals are spared until their `endedAt` ages past the
+ *    window (`--older-than`), or, with the `--keep <n>` backstop, unless they
+ *    are among the N most-recent.
+ * `running` records are never eligible. Deleting via the shared
+ * `deleteLaneArtifacts` helper keeps this the single delete primitive.
+ */
+function prune(
+  ctx: GcCtx,
+  names: string[],
+  worktrees: Map<string, string>,
+  olderThanMs: number | undefined,
+  keep: number | undefined,
+  summary: GcSummary,
+): void {
+  const window = olderThanMs ?? DEFAULT_OLDER_THAN_MS;
+  const nowMs = ctx.now();
+
+  const terminals = names
+    .map((name) => ctx.readRecord(ctx.repoRoot, name))
+    .filter((r): r is LaneRecord => r !== null && isTerminal(r.status))
+    .map((record) => ({ record, orphaned: !worktrees.has(record.branch) }));
+
+  // `--keep` protects the N most-recent NON-orphaned terminals (orphans always go).
+  const protectedNames = new Set<string>();
+  if (keep !== undefined) {
+    const ranked = terminals
+      .filter((t) => !t.orphaned)
+      .sort((a, b) => endedAtOf(b.record) - endedAtOf(a.record));
+    for (const t of ranked.slice(0, keep)) protectedNames.add(t.record.name);
+  }
+
+  for (const { record, orphaned } of terminals) {
+    const reason = pruneReason(record, orphaned, nowMs, window, keep, protectedNames);
+    if (reason === null) continue;
+    if (!ctx.dryRun) ctx.deleteArtifacts(ctx.repoRoot, record.name);
+    summary.pruned.push({ name: record.name, reason });
+  }
+}
+
+/** Why a terminal record should be pruned, or `null` to keep it. */
+function pruneReason(
+  record: LaneRecord,
+  orphaned: boolean,
+  nowMs: number,
+  window: number,
+  keep: number | undefined,
+  protectedNames: Set<string>,
+): GcPruned["reason"] | null {
+  if (orphaned) return "orphaned";
+  if (nowMs - endedAtOf(record) > window) return "aged";
+  if (keep !== undefined && !protectedNames.has(record.name)) return "keep";
+  return null;
+}
+
+/** A terminal record's end time; a missing `endedAt` sorts oldest / ages out. */
+function endedAtOf(record: LaneRecord): number {
+  return record.endedAt ?? 0;
 }
 
 /**

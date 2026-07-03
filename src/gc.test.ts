@@ -43,6 +43,8 @@ function harness(opts: {
   maxRunMs?: number;
   dryRun?: boolean;
   killOrphans?: boolean;
+  olderThanMs?: number;
+  keep?: number;
 }) {
   const records = new Map((opts.records ?? []).map((r) => [r.name, structuredClone(r)]));
   const worktrees = new Map(Object.entries(opts.worktrees ?? {}));
@@ -51,10 +53,13 @@ function harness(opts: {
   const writes: LaneRecord[] = [];
   const kills: Array<{ pgid: number; signal: string }> = [];
   const sleeps: number[] = [];
+  const deletes: string[] = [];
   const deps = {
     repoRoot: "/repo",
     dryRun: opts.dryRun,
     killOrphans: opts.killOrphans,
+    olderThanMs: opts.olderThanMs,
+    keep: opts.keep,
     now: () => opts.now ?? 100_000,
     isAlive: (pid: number) => alive.has(pid),
     groupAlive: (pgid: number) => aliveGroups.has(pgid),
@@ -74,8 +79,12 @@ function harness(opts: {
       writes.push(structuredClone(record));
       records.set(record.name, structuredClone(record));
     },
+    deleteArtifacts: (_root: string, name: string) => {
+      deletes.push(name);
+      records.delete(name);
+    },
   };
-  return { deps, records, writes, kills, sleeps, alive };
+  return { deps, records, writes, kills, sleeps, deletes, alive };
 }
 
 describe("gc persist-heal", () => {
@@ -367,5 +376,123 @@ describe("gc kill", () => {
       { name: "feature-x", pgid: 4321, signals: ["SIGTERM", "SIGKILL"] },
     ]);
     expect(summary.healed).toEqual([{ name: "feature-x", from: "running", to: "timed-out" }]);
+  });
+});
+
+/** A terminal `done` lane at `endedAt`; override name/branch/endedAt per test. */
+function doneAt(name: string, endedAt: number): LaneRecord {
+  return terminalRecord({ name, branch: `agetree/${name}`, endedAt });
+}
+
+describe("gc prune", () => {
+  it("prunes a terminal orphaned lane immediately, ignoring age", async () => {
+    const { deps, deletes } = harness({
+      records: [doneAt("orphan", 99_999)], // recent, but worktree is gone
+      worktrees: {},
+      now: 100_000,
+      olderThanMs: 1_000,
+    });
+
+    const summary = await gc(deps);
+
+    expect(deletes).toEqual(["orphan"]);
+    expect(summary.pruned).toEqual([{ name: "orphan", reason: "orphaned" }]);
+  });
+
+  it("prunes a terminal lane whose worktree still exists once it ages out", async () => {
+    const { deps, deletes } = harness({
+      records: [doneAt("old", 50_000)],
+      worktrees: { "agetree/old": "/wt/old" },
+      now: 100_000,
+      olderThanMs: 1_000, // 100_000 - 50_000 = 50_000 > 1_000
+    });
+
+    const summary = await gc(deps);
+
+    expect(deletes).toEqual(["old"]);
+    expect(summary.pruned).toEqual([{ name: "old", reason: "aged" }]);
+  });
+
+  it("keeps a recent terminal lane whose worktree still exists", async () => {
+    const { deps, deletes } = harness({
+      records: [doneAt("recent", 99_500)],
+      worktrees: { "agetree/recent": "/wt/recent" },
+      now: 100_000,
+      olderThanMs: 1_000, // 100_000 - 99_500 = 500 < 1_000
+    });
+
+    const summary = await gc(deps);
+
+    expect(deletes).toEqual([]);
+    expect(summary.pruned).toEqual([]);
+  });
+
+  it("never prunes a running lane", async () => {
+    const { deps, deletes } = harness({
+      records: [runningRecord()],
+      worktrees: { "agetree/feature-x": "/wt/feature-x" },
+      alivePids: [4321], // healthy running
+      now: 100_000,
+      olderThanMs: 1, // even a tiny window must not touch a running lane
+    });
+
+    const summary = await gc(deps);
+
+    expect(deletes).toEqual([]);
+    expect(summary.pruned).toEqual([]);
+  });
+
+  it("--keep <n> keeps the N most-recent terminals and prunes older ones regardless of age", async () => {
+    const { deps, deletes } = harness({
+      records: [
+        doneAt("newest", 99_900),
+        doneAt("middle", 99_800),
+        doneAt("oldest", 99_700),
+      ],
+      worktrees: {
+        "agetree/newest": "/wt/newest",
+        "agetree/middle": "/wt/middle",
+        "agetree/oldest": "/wt/oldest",
+      },
+      now: 100_000,
+      olderThanMs: 1_000_000, // none aged out — only --keep should prune
+      keep: 2,
+    });
+
+    const summary = await gc(deps);
+
+    expect(deletes).toEqual(["oldest"]);
+    expect(summary.pruned).toEqual([{ name: "oldest", reason: "keep" }]);
+  });
+
+  it("--dry-run reports the intended prune but deletes nothing", async () => {
+    const { deps, deletes } = harness({
+      records: [doneAt("orphan", 99_999)],
+      worktrees: {},
+      now: 100_000,
+      dryRun: true,
+    });
+
+    const summary = await gc(deps);
+
+    expect(deletes).toEqual([]);
+    expect(summary.pruned).toEqual([{ name: "orphan", reason: "orphaned" }]);
+  });
+
+  it("prunes a lane that gc healed into a terminal orphaned status this same pass", async () => {
+    // Dead-pid running lane with no worktree: pass 1 heals it to stale, pass 2
+    // re-reads and prunes it as an orphan.
+    const { deps, deletes } = harness({
+      records: [runningRecord()],
+      worktrees: {}, // no worktree
+      alivePids: [], // supervisor dead ⇒ heal to stale
+      now: 100_000,
+    });
+
+    const summary = await gc(deps);
+
+    expect(summary.healed).toEqual([{ name: "feature-x", from: "running", to: "stale" }]);
+    expect(deletes).toEqual(["feature-x"]);
+    expect(summary.pruned).toEqual([{ name: "feature-x", reason: "orphaned" }]);
   });
 });

@@ -4,6 +4,7 @@ import {
   readdirSync,
   readFileSync,
   renameSync,
+  rmSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
@@ -59,4 +60,18 @@ export function writeLaneRecordAtomic(root: string, record: LaneRecord): void {
   const tmpPath = `${recordPath}.${process.pid}.${Date.now()}.tmp`;
   writeFileSync(tmpPath, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
   renameSync(tmpPath, recordPath);
+}
+
+/**
+ * Remove ONLY a lane's `.agetree/` artifacts — its `<name>.json` record and
+ * `<name>.log` — and nothing else. It never touches the worktree or git branch
+ * (that stays the Bash engine's job; the TS↔Bash seam is one-directional). This
+ * is the shared delete primitive: `gc`'s prune calls it across the lane set, and
+ * the future `rm` / `merge --rm` per-lane cleanup will reuse it. Idempotent:
+ * missing files are not an error.
+ */
+export function deleteLaneArtifacts(root: string, name: string): void {
+  const { recordPath, logPath } = statePaths(root, name);
+  rmSync(recordPath, { force: true });
+  rmSync(logPath, { force: true });
 }
