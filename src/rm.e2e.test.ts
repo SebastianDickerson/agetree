@@ -63,11 +63,12 @@ function seededRepo(): { repo: string; worktree: string } {
 }
 
 describe("agetree rm (end-to-end: the built binary as a subprocess)", () => {
-  it("removes the worktree + branch and prunes the lane record; ls is then empty", () => {
+  it("--force removes the worktree + branch and prunes the lane record; ls is then empty", () => {
     const { repo, worktree } = seededRepo();
 
-    // "y" answers the engine's "delete the branch too?" prompt.
-    const rm = agetree(repo, ["rm", "feature-x", "--force"], "y\n");
+    // No stdin: --force alone must delete the branch, never prompting. (Non-tty
+    // callers — agetree, a parent agent, CI — always run with stdin at EOF.)
+    const rm = agetree(repo, ["rm", "feature-x", "--force"]);
     expect(rm.status).toBe(0);
 
     // The engine removed the worktree + branch...
@@ -81,6 +82,24 @@ describe("agetree rm (end-to-end: the built binary as a subprocess)", () => {
     const ls = agetree(repo, ["ls", "--json"]);
     expect(ls.status).toBe(0);
     expect(JSON.parse(ls.stdout)).toEqual([]);
+  });
+
+  it("bare rm (no --force, stdin at EOF) removes the worktree + record but keeps the branch, exit 0", () => {
+    const { repo, worktree } = seededRepo();
+
+    // No --force and stdin at EOF: the non-interactive default is non-destructive.
+    // The read must tolerate EOF (not crash under set -e), so the engine exits 0,
+    // which lets cleanupVanished prune the record. The commit survives on its branch.
+    const rm = agetree(repo, ["rm", "feature-x"]);
+    expect(rm.status).toBe(0);
+
+    // Worktree gone, but the branch is kept (add --force to also delete it).
+    expect(existsSync(worktree)).toBe(false);
+    expect(sh(repo, ["git", "branch", "--list", "agetree/feature-x"])).not.toBe("");
+
+    // Record + log pruned: exit 0 let cleanupVanished run on the vanished worktree.
+    expect(existsSync(recordPath(repo, "feature-x"))).toBe(false);
+    expect(existsSync(logPath(repo, "feature-x"))).toBe(false);
   });
 
   it("preserves the engine's exit code when the worktree does not exist", () => {

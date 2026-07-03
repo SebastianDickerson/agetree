@@ -381,7 +381,15 @@ cmd_run() {
 
 # ── rm ───────────────────────────────────────────────────────────────────
 cmd_rm() {
-  local branch="$1"
+  local branch="" force=false
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      --force) force=true ;;
+      *) [ -z "$branch" ] && branch="$arg" ;;
+    esac
+  done
+
   local path; path="$(resolve_wt "$branch")"
   [ -n "$path" ] && [ -d "$path" ] || { echo "No worktree found for branch '$branch'"; exit 1; }
 
@@ -389,7 +397,13 @@ cmd_rm() {
   git worktree remove "$path" --force
   echo "Removed worktree $path"
 
-  read -rp "Delete branch '$branch' too? [y/N] " ans
+  if [ "$force" = true ]; then
+    git branch -D "$branch"
+    echo "Deleted branch $branch"
+    return
+  fi
+
+  read -rp "Delete branch '$branch' too? [y/N] " ans || ans=""
   if [[ "$ans" =~ ^[Yy]$ ]]; then
     git branch -D "$branch"
     echo "Deleted branch $branch"
