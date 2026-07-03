@@ -19,10 +19,11 @@ import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { createEngine } from "./engine.ts";
 import { runList } from "./list.ts";
+import { runLogs } from "./logs.ts";
 import { resolvePrompt, runHeadless } from "./run.ts";
 
 /** Documented verbs that belong to later slices — recognized but not built here. */
-const STUB_VERBS = new Set(["new", "logs", "merge", "rm", "gc", "reap", "engine"]);
+const STUB_VERBS = new Set(["new", "merge", "rm", "gc", "reap", "engine"]);
 
 /** Parsed `run` headless options. Captures the whole flag surface; the
  * dispatcher forwards the fields the `runHeadless` entrypoint supports today
@@ -49,6 +50,7 @@ export type CliResult =
   | { kind: "run-headless"; run: HeadlessArgs }
   | { kind: "run-interactive"; branch: string }
   | { kind: "ls"; json: boolean; all: boolean }
+  | { kind: "logs"; identifier: string; follow: boolean; lines?: number }
   | { kind: "stub"; verb: string }
   | { kind: "help"; verb?: string }
   | { kind: "error"; message: string };
@@ -72,6 +74,12 @@ const RUN_OPTIONS = {
 const LS_OPTIONS = {
   json: { type: "boolean" },
   all: { type: "boolean" },
+  help: { type: "boolean" },
+} as const;
+
+const LOGS_OPTIONS = {
+  follow: { type: "boolean", short: "f" },
+  lines: { type: "string" },
   help: { type: "boolean" },
 } as const;
 
@@ -111,6 +119,7 @@ export function parseCli(argv: string[]): CliResult {
   }
   if (verb === "run") return parseRun(rest);
   if (verb === "ls") return parseLs(rest);
+  if (verb === "logs") return parseLogs(rest);
   if (STUB_VERBS.has(verb)) return { kind: "stub", verb };
   return { kind: "error", message: `unknown command '${verb}'\n\n${USAGE}` };
 }
@@ -205,6 +214,52 @@ function parseLs(rest: string[]): CliResult {
   return { kind: "ls", json: (values.json as boolean | undefined) ?? false, all: (values.all as boolean | undefined) ?? false };
 }
 
+function parseLogs(rest: string[]): CliResult {
+  let values: Record<string, unknown>;
+  let positionals: string[];
+  try {
+    ({ values, positionals } = parseArgs({
+      args: rest,
+      allowPositionals: true,
+      options: LOGS_OPTIONS,
+    }));
+  } catch (error) {
+    return { kind: "error", message: msgOf(error) };
+  }
+
+  if (values.help) return { kind: "help", verb: "logs" };
+
+  const identifier = positionals[0];
+  if (identifier === undefined) {
+    return { kind: "error", message: "logs requires a branch or lane name" };
+  }
+  if (positionals.length > 1) {
+    return { kind: "error", message: `logs takes one positional argument (got '${positionals[1]}')` };
+  }
+
+  let lines: number | undefined;
+  if (values.lines !== undefined) {
+    lines = parsePositiveInt(values.lines as string);
+    if (lines === undefined) {
+      return { kind: "error", message: `--lines must be a positive integer (got '${values.lines}')` };
+    }
+  }
+
+  return {
+    kind: "logs",
+    identifier,
+    follow: (values.follow as boolean | undefined) ?? false,
+    lines,
+  };
+}
+
+/** Parse a strictly-positive integer (`1`, `10`, …); undefined on anything else. */
+function parsePositiveInt(input: string): number | undefined {
+  if (!/^\d+$/.test(input.trim())) return undefined;
+  const value = Number(input);
+  return Number.isInteger(value) && value > 0 ? value : undefined;
+}
+
 // ── Dispatch ──────────────────────────────────────────────────────────────
 
 export type CliDeps = {
@@ -214,6 +269,7 @@ export type CliDeps = {
   // Injectable command entrypoints (tests assert forwarding + exit-code passthrough).
   runHeadless?: typeof runHeadless;
   runList?: typeof runList;
+  runLogs?: typeof runLogs;
   createEngine?: typeof createEngine;
   resolvePrompt?: typeof resolvePrompt;
 };
@@ -246,6 +302,18 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
         repoRoot: cwd,
         json: result.json,
         all: result.all,
+        out,
+        err,
+      });
+      return exitCode;
+    }
+    case "logs": {
+      const logs = deps.runLogs ?? runLogs;
+      const { exitCode } = await logs({
+        repoRoot: cwd,
+        identifier: result.identifier,
+        follow: result.follow,
+        lines: result.lines,
         out,
         err,
       });
@@ -294,7 +362,8 @@ const USAGE = `usage: agetree <command> [options]
 commands:
   run [branch] [base]    start a lane — interactive (no prompt) or headless (--prompt/--prompt-file)
   ls [--json] [--all]    list lanes reconciled against git worktrees
-  new logs merge rm gc engine    (not implemented yet)
+  logs <lane|branch>     print or tail a lane's log ([-f|--follow] [--lines <n>])
+  new merge rm gc engine    (not implemented yet)
 
 run 'agetree <command> --help' for command details`;
 
@@ -330,9 +399,23 @@ options:
 
 exit codes: 0 normally, 2 on an operational error.`;
 
+const LOGS_HELP = `usage: agetree logs <branch-or-lane> [-f|--follow] [--lines <n>]
+
+  Print (or tail) a lane's log at .agetree/logs/<name>.log, resolving a lane
+  name or a branch to its record. Raw log bytes go to stdout; this is a
+  human-facing text stream (no --json).
+
+options:
+  -f, --follow    print current content, then stream appended output
+  --lines <n>     print only the last n lines (positive integer)
+
+exit codes: 0 = printed (follow exits 0 on a clean stop),
+            2 = no such lane / unreadable log / bad flags.`;
+
 function helpText(verb?: string): string {
   if (verb === "run") return `${RUN_HELP}\n`;
   if (verb === "ls") return `${LS_HELP}\n`;
+  if (verb === "logs") return `${LOGS_HELP}\n`;
   return `${USAGE}\n`;
 }
 

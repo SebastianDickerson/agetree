@@ -29,7 +29,7 @@ describe("parseCli — verb routing", () => {
   });
 
   it("stubs the unimplemented verbs", () => {
-    for (const verb of ["new", "logs", "merge", "rm", "gc", "engine"]) {
+    for (const verb of ["new", "merge", "rm", "gc", "engine"]) {
       const r = parseCli([verb]);
       expect(r.kind).toBe("stub");
       if (r.kind === "stub") expect(r.verb).toBe(verb);
@@ -185,6 +185,71 @@ describe("parseCli — ls and the --all mapping", () => {
   });
 });
 
+describe("parseCli — logs", () => {
+  it("parses an identifier with no flags", () => {
+    expect(parseCli(["logs", "feature-x"])).toEqual({
+      kind: "logs",
+      identifier: "feature-x",
+      follow: false,
+      lines: undefined,
+    });
+  });
+
+  it("accepts a branch as the identifier", () => {
+    const r = parseCli(["logs", "agetree/feature-x"]);
+    if (r.kind === "logs") expect(r.identifier).toBe("agetree/feature-x");
+    else throw new Error("expected logs");
+  });
+
+  it("-f / --follow set follow", () => {
+    const short = parseCli(["logs", "feature-x", "-f"]);
+    if (short.kind === "logs") expect(short.follow).toBe(true);
+    else throw new Error("expected logs");
+    const long = parseCli(["logs", "feature-x", "--follow"]);
+    if (long.kind === "logs") expect(long.follow).toBe(true);
+    else throw new Error("expected logs");
+  });
+
+  it("--lines parses a positive integer", () => {
+    const r = parseCli(["logs", "feature-x", "--lines", "20"]);
+    if (r.kind === "logs") expect(r.lines).toBe(20);
+    else throw new Error("expected logs");
+  });
+
+  it("missing identifier → error", () => {
+    const r = parseCli(["logs"]);
+    expect(r.kind).toBe("error");
+    if (r.kind === "error") expect(r.message).toMatch(/requires a branch or lane/);
+  });
+
+  it("rejects a non-positive / non-integer --lines", () => {
+    for (const bad of ["0", "1.5", "abc"]) {
+      const r = parseCli(["logs", "feature-x", "--lines", bad]);
+      expect(r.kind).toBe("error");
+      if (r.kind === "error") expect(r.message).toMatch(/--lines must be a positive integer/);
+    }
+    // A dash-prefixed value (e.g. -5) is rejected by parseArgs itself — still
+    // an operational error, just before our positive-integer check runs.
+    expect(parseCli(["logs", "feature-x", "--lines", "-5"]).kind).toBe("error");
+    expect(parseCli(["logs", "feature-x", "--lines=-5"]).kind).toBe("error");
+  });
+
+  it("rejects an unknown flag", () => {
+    const r = parseCli(["logs", "feature-x", "--bogus"]);
+    expect(r.kind).toBe("error");
+    if (r.kind === "error") expect(r.message).toMatch(/bogus/i);
+  });
+
+  it("rejects a second positional argument", () => {
+    const r = parseCli(["logs", "feature-x", "extra"]);
+    expect(r.kind).toBe("error");
+  });
+
+  it("logs --help → help for logs", () => {
+    expect(parseCli(["logs", "--help"])).toEqual({ kind: "help", verb: "logs" });
+  });
+});
+
 describe("parseDuration", () => {
   it("parses units and bare numbers", () => {
     expect(parseDuration("250")).toBe(250);
@@ -264,6 +329,25 @@ describe("runCli — dispatch and exit-code passthrough", () => {
     );
   });
 
+  it("surfaces runLogs's exit code and forwards the resolved logs options", async () => {
+    const runLogsSpy = vi.fn(async () => ({ exitCode: 2 }));
+    const code = await runCli(["logs", "feature-x", "-f", "--lines", "5"], {
+      cwd: "/repo",
+      out: collector(),
+      err: collector(),
+      runLogs: runLogsSpy,
+    });
+    expect(code).toBe(2);
+    expect(runLogsSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        repoRoot: "/repo",
+        identifier: "feature-x",
+        follow: true,
+        lines: 5,
+      }),
+    );
+  });
+
   it("interactive run delegates to engine.runInteractive and returns its code", async () => {
     const runInteractive = vi.fn(async () => 42);
     const engine: Engine = {
@@ -285,9 +369,9 @@ describe("runCli — dispatch and exit-code passthrough", () => {
   it("stub verbs exit 2 with a not-implemented message on stderr", async () => {
     const out = collector();
     const err = collector();
-    const code = await runCli(["logs", "feature-x"], { out, err });
+    const code = await runCli(["merge", "main"], { out, err });
     expect(code).toBe(2);
-    expect(err.text).toMatch(/agetree logs: not implemented yet/);
+    expect(err.text).toMatch(/agetree merge: not implemented yet/);
     expect(out.text).toBe("");
   });
 
