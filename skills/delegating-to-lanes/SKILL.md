@@ -114,9 +114,9 @@ agetree merge <target> <branch> --rm
 ```
 
 For cleanup, lean on `merge <target> <branch> --rm` (cleans worktree + branch + record) and
-`agetree gc` (prunes orphaned/terminal records). Avoid bare `agetree rm <lane>` for
-happy-path cleanup — on a `done` lane the engine's interactive prompt makes it exit non-zero
-and leave the branch + an orphaned record behind (which `gc` then reaps).
+`agetree gc` (prunes orphaned/terminal records). Bare `agetree rm <lane>` removes the
+worktree + lane record and keeps the branch (non-destructive default); add `--force` to also
+delete the branch.
 
 ## Everything else — defer to `--help`
 
