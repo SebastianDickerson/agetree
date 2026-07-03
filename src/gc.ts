@@ -18,6 +18,7 @@
  * the CLI wiring — each an isolated sharp edge.
  */
 
+import type { Writable } from "node:stream";
 import { defaultWorktreeReader, type WorktreeReader } from "./engine.ts";
 import { isTerminal, reconcile, STATUS, type LaneRecord, type Status } from "./lane-state.ts";
 import {
@@ -352,6 +353,65 @@ function healLane(
 
   if (!ctx.dryRun) ctx.writeRecord(ctx.repoRoot, reconciled);
   summary.healed.push({ name, from: from.status, to: reconciled.status });
+}
+
+// ── Output shaping ──────────────────────────────────────────────────────────
+
+/**
+ * `--json`: the whole summary as one newline-terminated JSON object
+ * (`{healed, killed, pruned, skipped}`, additive-only). stdout carries only this.
+ */
+export function formatGcJson(summary: GcSummary): string {
+  return `${JSON.stringify(summary)}\n`;
+}
+
+/**
+ * Human projection: one line per action (a pure projection of the same summary
+ * the JSON emits, no separate schema), then a tally. "nothing to do" when the
+ * pass took no action.
+ */
+export function formatGcHuman(summary: GcSummary): string {
+  const lines: string[] = [];
+  for (const h of summary.healed) lines.push(`healed   ${h.name}  ${h.from} → ${h.to}`);
+  for (const k of summary.killed) {
+    lines.push(`killed   ${k.name}  pgid ${k.pgid} (${k.signals.join(", ")})`);
+  }
+  for (const p of summary.pruned) lines.push(`pruned   ${p.name}  ${p.reason}`);
+  for (const s of summary.skipped) lines.push(`skipped  ${s.name}  ${s.reason}`);
+
+  const tally = `${summary.healed.length} healed, ${summary.killed.length} killed, ${summary.pruned.length} pruned, ${summary.skipped.length} skipped`;
+  if (lines.length === 0) return `gc: nothing to do (${tally})\n`;
+  return `${lines.join("\n")}\n${tally}\n`;
+}
+
+// ── Command orchestration ─────────────────────────────────────────────────────
+
+export type RunGcOptions = GcOptions & {
+  json?: boolean;
+  out?: Writable;
+  err?: Writable;
+};
+
+export type RunGcResult = { exitCode: number };
+
+/**
+ * The `agetree gc` command: run the janitor + shape output. Under `--json`,
+ * stdout carries only the summary object and diagnostics go to stderr. Exit 0 =
+ * ran cleanly (even with nothing to do, and even if a per-lane kill failed — that
+ * is reported in `skipped`, not fatal); exit 2 = operational error (unreadable
+ * dir / git failure). Bad flags are rejected earlier by the parser.
+ */
+export async function runGc(opts: RunGcOptions): Promise<RunGcResult> {
+  const out = opts.out ?? process.stdout;
+  const err = opts.err ?? process.stderr;
+  try {
+    const summary = await gc(opts);
+    out.write(opts.json ? formatGcJson(summary) : formatGcHuman(summary));
+    return { exitCode: 0 };
+  } catch (error) {
+    err.write(`agetree: ${errorMessage(error)}\n`);
+    return { exitCode: 2 };
+  }
 }
 
 // ── default seams (real process/signal/clock) ──

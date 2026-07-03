@@ -18,12 +18,13 @@ import type { Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { createEngine } from "./engine.ts";
+import { runGc } from "./gc.ts";
 import { runList } from "./list.ts";
 import { runLogs } from "./logs.ts";
 import { resolvePrompt, runHeadless } from "./run.ts";
 
 /** Documented verbs that belong to later slices — recognized but not built here. */
-const STUB_VERBS = new Set(["new", "merge", "rm", "gc", "reap", "engine"]);
+const STUB_VERBS = new Set(["new", "merge", "rm", "engine"]);
 
 /** Parsed `run` headless options. Captures the whole flag surface; the
  * dispatcher forwards the fields the `runHeadless` entrypoint supports today
@@ -45,12 +46,22 @@ export type HeadlessArgs = {
   adapterArgs: string[];
 };
 
+/** Parsed `gc` options (the whole-set janitor; no positionals). */
+export type GcArgs = {
+  dryRun: boolean;
+  json: boolean;
+  olderThanMs?: number;
+  keep?: number;
+  killOrphans: boolean;
+};
+
 /** The pure result of parsing argv — a plan the dispatcher executes. */
 export type CliResult =
   | { kind: "run-headless"; run: HeadlessArgs }
   | { kind: "run-interactive"; branch: string }
   | { kind: "ls"; json: boolean; all: boolean }
   | { kind: "logs"; identifier: string; follow: boolean; lines?: number }
+  | { kind: "gc"; gc: GcArgs }
   | { kind: "stub"; verb: string }
   | { kind: "help"; verb?: string }
   | { kind: "error"; message: string };
@@ -80,6 +91,15 @@ const LS_OPTIONS = {
 const LOGS_OPTIONS = {
   follow: { type: "boolean", short: "f" },
   lines: { type: "string" },
+  help: { type: "boolean" },
+} as const;
+
+const GC_OPTIONS = {
+  "dry-run": { type: "boolean" },
+  json: { type: "boolean" },
+  "older-than": { type: "string" },
+  keep: { type: "string" },
+  "kill-orphans": { type: "boolean" },
   help: { type: "boolean" },
 } as const;
 
@@ -120,6 +140,8 @@ export function parseCli(argv: string[]): CliResult {
   if (verb === "run") return parseRun(rest);
   if (verb === "ls") return parseLs(rest);
   if (verb === "logs") return parseLogs(rest);
+  // `reap` is a hidden alias for `gc` — one concept, one implementation.
+  if (verb === "gc" || verb === "reap") return parseGc(rest);
   if (STUB_VERBS.has(verb)) return { kind: "stub", verb };
   return { kind: "error", message: `unknown command '${verb}'\n\n${USAGE}` };
 }
@@ -253,6 +275,53 @@ function parseLogs(rest: string[]): CliResult {
   };
 }
 
+function parseGc(rest: string[]): CliResult {
+  let values: Record<string, unknown>;
+  let positionals: string[];
+  try {
+    ({ values, positionals } = parseArgs({
+      args: rest,
+      allowPositionals: true,
+      options: GC_OPTIONS,
+    }));
+  } catch (error) {
+    return { kind: "error", message: msgOf(error) };
+  }
+
+  if (values.help) return { kind: "help", verb: "gc" };
+  if (positionals.length > 0) {
+    return { kind: "error", message: `gc takes no positional arguments (got '${positionals[0]}')` };
+  }
+
+  let olderThanMs: number | undefined;
+  if (values["older-than"] !== undefined) {
+    try {
+      olderThanMs = parseDuration(values["older-than"] as string);
+    } catch (error) {
+      return { kind: "error", message: msgOf(error) };
+    }
+  }
+
+  let keep: number | undefined;
+  if (values.keep !== undefined) {
+    keep = parsePositiveInt(values.keep as string);
+    if (keep === undefined) {
+      return { kind: "error", message: `--keep must be a positive integer (got '${values.keep}')` };
+    }
+  }
+
+  return {
+    kind: "gc",
+    gc: {
+      dryRun: (values["dry-run"] as boolean | undefined) ?? false,
+      json: (values.json as boolean | undefined) ?? false,
+      olderThanMs,
+      keep,
+      killOrphans: (values["kill-orphans"] as boolean | undefined) ?? false,
+    },
+  };
+}
+
 /** Parse a strictly-positive integer (`1`, `10`, …); undefined on anything else. */
 function parsePositiveInt(input: string): number | undefined {
   if (!/^\d+$/.test(input.trim())) return undefined;
@@ -270,6 +339,7 @@ export type CliDeps = {
   runHeadless?: typeof runHeadless;
   runList?: typeof runList;
   runLogs?: typeof runLogs;
+  runGc?: typeof runGc;
   createEngine?: typeof createEngine;
   resolvePrompt?: typeof resolvePrompt;
 };
@@ -319,6 +389,20 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
       });
       return exitCode;
     }
+    case "gc": {
+      const run = deps.runGc ?? runGc;
+      const { exitCode } = await run({
+        repoRoot: cwd,
+        dryRun: result.gc.dryRun,
+        json: result.gc.json,
+        olderThanMs: result.gc.olderThanMs,
+        keep: result.gc.keep,
+        killOrphans: result.gc.killOrphans,
+        out,
+        err,
+      });
+      return exitCode;
+    }
     case "run-interactive": {
       const engine = (deps.createEngine ?? createEngine)({ cwd });
       return engine.runInteractive(result.branch);
@@ -363,7 +447,8 @@ commands:
   run [branch] [base]    start a lane — interactive (no prompt) or headless (--prompt/--prompt-file)
   ls [--json] [--all]    list lanes reconciled against git worktrees
   logs <lane|branch>     print or tail a lane's log ([-f|--follow] [--lines <n>])
-  new merge rm gc engine    (not implemented yet)
+  gc                     heal, kill and prune stale/terminal lanes ([--dry-run] [--json] …)
+  new merge rm engine    (not implemented yet)
 
 run 'agetree <command> --help' for command details`;
 
@@ -412,10 +497,28 @@ options:
 exit codes: 0 = printed (follow exits 0 on a clean stop),
             2 = no such lane / unreadable log / bad flags.`;
 
+const GC_HELP = `usage: agetree gc [--dry-run] [--json] [--older-than <dur>] [--keep <n>] [--kill-orphans]
+
+  The whole-set janitor: one pass over .agetree/lanes doing persist-heal → kill
+  → prune. It only mutates .agetree/ — never a worktree or git branch. Explicit
+  only; ls/run/wait never trigger it. No positional arguments.
+
+options:
+  --dry-run          report intended heal/kill/prune and touch nothing
+  --json             emit one newline-terminated JSON summary on stdout
+                     ({healed, killed, pruned, skipped}); diagnostics to stderr
+  --older-than <dur> prune non-orphaned terminals older than this (default 7 days; e.g. 24h, 30m)
+  --keep <n>         backstop: keep the N most-recent terminals, prune older ones
+  --kill-orphans     also best-effort group-kill a stale lane whose group survives
+
+exit codes: 0 = ran cleanly (even nothing to do; a per-lane kill failure is
+            reported, not fatal); 2 = operational error (bad flag / unreadable dir).`;
+
 function helpText(verb?: string): string {
   if (verb === "run") return `${RUN_HELP}\n`;
   if (verb === "ls") return `${LS_HELP}\n`;
   if (verb === "logs") return `${LOGS_HELP}\n`;
+  if (verb === "gc") return `${GC_HELP}\n`;
   return `${USAGE}\n`;
 }
 

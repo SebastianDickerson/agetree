@@ -29,11 +29,78 @@ describe("parseCli — verb routing", () => {
   });
 
   it("stubs the unimplemented verbs", () => {
-    for (const verb of ["new", "merge", "rm", "gc", "engine"]) {
+    for (const verb of ["new", "merge", "rm", "engine"]) {
       const r = parseCli([verb]);
       expect(r.kind).toBe("stub");
       if (r.kind === "stub") expect(r.verb).toBe(verb);
     }
+  });
+});
+
+describe("parseCli — gc", () => {
+  it("plain gc → all flags default off/unset", () => {
+    expect(parseCli(["gc"])).toEqual({
+      kind: "gc",
+      gc: { dryRun: false, json: false, olderThanMs: undefined, keep: undefined, killOrphans: false },
+    });
+  });
+
+  it("reap is a hidden alias for gc", () => {
+    const r = parseCli(["reap"]);
+    expect(r.kind).toBe("gc");
+  });
+
+  it("maps every flag", () => {
+    const r = parseCli([
+      "gc",
+      "--dry-run",
+      "--json",
+      "--older-than",
+      "24h",
+      "--keep",
+      "10",
+      "--kill-orphans",
+    ]);
+    expect(r).toEqual({
+      kind: "gc",
+      gc: {
+        dryRun: true,
+        json: true,
+        olderThanMs: 86_400_000,
+        keep: 10,
+        killOrphans: true,
+      },
+    });
+  });
+
+  it("rejects a positional argument", () => {
+    const r = parseCli(["gc", "some-lane"]);
+    expect(r.kind).toBe("error");
+    if (r.kind === "error") expect(r.message).toMatch(/no positional arguments/);
+  });
+
+  it("rejects a malformed --older-than duration", () => {
+    const r = parseCli(["gc", "--older-than", "soon"]);
+    expect(r.kind).toBe("error");
+    if (r.kind === "error") expect(r.message).toMatch(/invalid duration/);
+  });
+
+  it("rejects a non-positive / non-integer --keep", () => {
+    for (const bad of ["0", "1.5", "abc"]) {
+      const r = parseCli(["gc", "--keep", bad]);
+      expect(r.kind).toBe("error");
+      if (r.kind === "error") expect(r.message).toMatch(/--keep must be a positive integer/);
+    }
+  });
+
+  it("rejects an unknown flag", () => {
+    const r = parseCli(["gc", "--bogus"]);
+    expect(r.kind).toBe("error");
+    if (r.kind === "error") expect(r.message).toMatch(/bogus/i);
+  });
+
+  it("gc --help → help for gc", () => {
+    expect(parseCli(["gc", "--help"])).toEqual({ kind: "help", verb: "gc" });
   });
 });
 
@@ -344,6 +411,25 @@ describe("runCli — dispatch and exit-code passthrough", () => {
         identifier: "feature-x",
         follow: true,
         lines: 5,
+      }),
+    );
+  });
+
+  it("surfaces runGc's exit code and forwards the resolved gc options", async () => {
+    const runGcSpy = vi.fn(async () => ({ exitCode: 0 }));
+    const code = await runCli(
+      ["gc", "--dry-run", "--json", "--older-than", "24h", "--keep", "5", "--kill-orphans"],
+      { cwd: "/repo", out: collector(), err: collector(), runGc: runGcSpy },
+    );
+    expect(code).toBe(0);
+    expect(runGcSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        repoRoot: "/repo",
+        dryRun: true,
+        json: true,
+        olderThanMs: 86_400_000,
+        keep: 5,
+        killOrphans: true,
       }),
     );
   });

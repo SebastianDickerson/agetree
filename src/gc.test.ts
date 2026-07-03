@@ -1,6 +1,19 @@
 import { describe, expect, it, vi } from "vitest";
+import { Writable } from "node:stream";
 import type { LaneRecord, Status } from "./lane-state.ts";
-import { gc } from "./gc.ts";
+import { formatGcHuman, gc, runGc } from "./gc.ts";
+
+function collector(): Writable & { text: string } {
+  let text = "";
+  const stream = new Writable({
+    write(chunk, _enc, cb) {
+      text += chunk;
+      cb();
+    },
+  }) as Writable & { text: string };
+  Object.defineProperty(stream, "text", { get: () => text });
+  return stream;
+}
 
 /** A running lane record with sensible defaults; override per test. */
 function runningRecord(over: Partial<LaneRecord> = {}): LaneRecord {
@@ -494,5 +507,72 @@ describe("gc prune", () => {
     expect(summary.healed).toEqual([{ name: "feature-x", from: "running", to: "stale" }]);
     expect(deletes).toEqual(["feature-x"]);
     expect(summary.pruned).toEqual([{ name: "feature-x", reason: "orphaned" }]);
+  });
+});
+
+describe("runGc output + exit codes", () => {
+  it("exits 0 with a JSON-only summary on stdout under --json", async () => {
+    const { deps } = harness({
+      records: [runningRecord()],
+      worktrees: { "agetree/feature-x": "/wt/feature-x" },
+      alivePids: [], // heal to stale
+    });
+    const out = collector();
+    const err = collector();
+
+    const res = await runGc({ ...deps, json: true, out, err });
+
+    expect(res.exitCode).toBe(0);
+    expect(err.text).toBe("");
+    expect(out.text.endsWith("\n")).toBe(true);
+    expect(out.text.trimEnd().split("\n")).toHaveLength(1); // single JSON object
+    const summary = JSON.parse(out.text);
+    expect(summary.healed).toEqual([{ name: "feature-x", from: "running", to: "stale" }]);
+    expect(summary).toHaveProperty("killed");
+    expect(summary).toHaveProperty("pruned");
+    expect(summary).toHaveProperty("skipped");
+  });
+
+  it("exits 0 with a 'nothing to do' line when there is nothing to do", async () => {
+    const { deps } = harness({ records: [], worktrees: {} });
+    const out = collector();
+
+    const res = await runGc({ ...deps, out, err: collector() });
+
+    expect(res.exitCode).toBe(0);
+    expect(out.text).toMatch(/nothing to do/);
+  });
+
+  it("exits 2 with empty stdout and a stderr diagnostic on an operational error", async () => {
+    const { deps } = harness({ records: [] });
+    const out = collector();
+    const err = collector();
+
+    const res = await runGc({
+      ...deps,
+      listWorktrees: async () => {
+        throw new Error("git boom");
+      },
+      out,
+      err,
+    });
+
+    expect(res.exitCode).toBe(2);
+    expect(out.text).toBe("");
+    expect(err.text).toMatch(/git boom/);
+  });
+
+  it("formatGcHuman lists one line per action plus a tally", () => {
+    const text = formatGcHuman({
+      healed: [{ name: "a", from: "running", to: "stale" }],
+      killed: [{ name: "b", pgid: 42, signals: ["SIGTERM", "SIGKILL"] }],
+      pruned: [{ name: "c", reason: "orphaned" }],
+      skipped: [{ name: "d", reason: "kill failed: EPERM" }],
+    });
+    expect(text).toContain("healed   a  running → stale");
+    expect(text).toContain("killed   b  pgid 42 (SIGTERM, SIGKILL)");
+    expect(text).toContain("pruned   c  orphaned");
+    expect(text).toContain("skipped  d  kill failed: EPERM");
+    expect(text).toContain("1 healed, 1 killed, 1 pruned, 1 skipped");
   });
 });
