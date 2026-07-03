@@ -29,11 +29,105 @@ describe("parseCli — verb routing", () => {
   });
 
   it("stubs the unimplemented verbs", () => {
-    for (const verb of ["new", "merge", "rm", "engine"]) {
+    for (const verb of ["new", "engine"]) {
       const r = parseCli([verb]);
       expect(r.kind).toBe("stub");
       if (r.kind === "stub") expect(r.verb).toBe(verb);
     }
+  });
+});
+
+describe("parseCli — merge", () => {
+  it("target only → empty branches, flags off", () => {
+    expect(parseCli(["merge", "main"])).toEqual({
+      kind: "merge",
+      target: "main",
+      branches: [],
+      all: false,
+      rm: false,
+    });
+  });
+
+  it("target + branches", () => {
+    expect(parseCli(["merge", "main", "feat-a", "feat-b"])).toEqual({
+      kind: "merge",
+      target: "main",
+      branches: ["feat-a", "feat-b"],
+      all: false,
+      rm: false,
+    });
+  });
+
+  it("maps --all and --rm", () => {
+    expect(parseCli(["merge", "main", "--all", "--rm"])).toEqual({
+      kind: "merge",
+      target: "main",
+      branches: [],
+      all: true,
+      rm: true,
+    });
+  });
+
+  it("missing target → error", () => {
+    const r = parseCli(["merge"]);
+    expect(r.kind).toBe("error");
+    if (r.kind === "error") expect(r.message).toMatch(/merge requires a target/);
+  });
+
+  it("rejects an unknown flag", () => {
+    const r = parseCli(["merge", "main", "--bogus"]);
+    expect(r.kind).toBe("error");
+    if (r.kind === "error") expect(r.message).toMatch(/bogus/i);
+  });
+
+  it("merge --help → help for merge", () => {
+    expect(parseCli(["merge", "--help"])).toEqual({ kind: "help", verb: "merge" });
+  });
+});
+
+describe("parseCli — rm", () => {
+  it("identifier only → force off", () => {
+    expect(parseCli(["rm", "feature-x"])).toEqual({
+      kind: "rm",
+      identifier: "feature-x",
+      force: false,
+    });
+  });
+
+  it("accepts a branch as the identifier", () => {
+    const r = parseCli(["rm", "agetree/feature-x"]);
+    if (r.kind === "rm") expect(r.identifier).toBe("agetree/feature-x");
+    else throw new Error("expected rm");
+  });
+
+  it("maps --force", () => {
+    expect(parseCli(["rm", "feature-x", "--force"])).toEqual({
+      kind: "rm",
+      identifier: "feature-x",
+      force: true,
+    });
+  });
+
+  it("missing identifier → error", () => {
+    const r = parseCli(["rm"]);
+    expect(r.kind).toBe("error");
+    if (r.kind === "error") expect(r.message).toMatch(/rm requires a branch or lane/);
+  });
+
+  it("rejects a second positional argument", () => {
+    const r = parseCli(["rm", "feature-x", "extra"]);
+    expect(r.kind).toBe("error");
+    if (r.kind === "error") expect(r.message).toMatch(/one positional argument/);
+  });
+
+  it("rejects an unknown flag", () => {
+    const r = parseCli(["rm", "feature-x", "--bogus"]);
+    expect(r.kind).toBe("error");
+    if (r.kind === "error") expect(r.message).toMatch(/bogus/i);
+  });
+
+  it("rm --help → help for rm", () => {
+    expect(parseCli(["rm", "--help"])).toEqual({ kind: "help", verb: "rm" });
   });
 });
 
@@ -455,10 +549,44 @@ describe("runCli — dispatch and exit-code passthrough", () => {
   it("stub verbs exit 2 with a not-implemented message on stderr", async () => {
     const out = collector();
     const err = collector();
-    const code = await runCli(["merge", "main"], { out, err });
+    const code = await runCli(["engine", "ls"], { out, err });
     expect(code).toBe(2);
-    expect(err.text).toMatch(/agetree merge: not implemented yet/);
+    expect(err.text).toMatch(/agetree engine: not implemented yet/);
     expect(out.text).toBe("");
+  });
+
+  it("surfaces runMerge's exit code and forwards the resolved merge options", async () => {
+    const runMergeSpy = vi.fn(async () => ({ exitCode: 1 }));
+    const code = await runCli(["merge", "main", "feat-a", "feat-b", "--all", "--rm"], {
+      cwd: "/repo",
+      out: collector(),
+      err: collector(),
+      runMerge: runMergeSpy,
+    });
+    expect(code).toBe(1);
+    expect(runMergeSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        repoRoot: "/repo",
+        target: "main",
+        branches: ["feat-a", "feat-b"],
+        all: true,
+        rm: true,
+      }),
+    );
+  });
+
+  it("surfaces runRm's exit code and forwards the resolved rm options", async () => {
+    const runRmSpy = vi.fn(async () => ({ exitCode: 0 }));
+    const code = await runCli(["rm", "feature-x", "--force"], {
+      cwd: "/repo",
+      out: collector(),
+      err: collector(),
+      runRm: runRmSpy,
+    });
+    expect(code).toBe(0);
+    expect(runRmSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ repoRoot: "/repo", identifier: "feature-x", force: true }),
+    );
   });
 
   it("errors exit 2 with diagnostics on stderr, nothing on stdout", async () => {

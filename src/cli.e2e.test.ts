@@ -79,7 +79,7 @@ describe("agetree CLI (end-to-end: the built binary as a subprocess)", () => {
 
   it("a stub verb exits 2 with an empty stdout", () => {
     const { repo } = freshRepoWithWorktree();
-    const res = agetree(repo, ["merge", "main"]);
+    const res = agetree(repo, ["engine", "ls"]);
     expect(res.status).toBe(2);
     expect(res.stdout).toBe("");
     expect(res.stderr).toMatch(/not implemented yet/);

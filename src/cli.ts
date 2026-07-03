@@ -21,10 +21,12 @@ import { createEngine } from "./engine.ts";
 import { runGc } from "./gc.ts";
 import { runList } from "./list.ts";
 import { runLogs } from "./logs.ts";
+import { runMerge } from "./merge.ts";
+import { runRm } from "./rm.ts";
 import { resolvePrompt, runHeadless } from "./run.ts";
 
 /** Documented verbs that belong to later slices — recognized but not built here. */
-const STUB_VERBS = new Set(["new", "merge", "rm", "engine"]);
+const STUB_VERBS = new Set(["new", "engine"]);
 
 /** Parsed `run` headless options. Captures the whole flag surface; the
  * dispatcher forwards the fields the `runHeadless` entrypoint supports today
@@ -62,6 +64,8 @@ export type CliResult =
   | { kind: "ls"; json: boolean; all: boolean }
   | { kind: "logs"; identifier: string; follow: boolean; lines?: number }
   | { kind: "gc"; gc: GcArgs }
+  | { kind: "merge"; target: string; branches: string[]; all: boolean; rm: boolean }
+  | { kind: "rm"; identifier: string; force: boolean }
   | { kind: "stub"; verb: string }
   | { kind: "help"; verb?: string }
   | { kind: "error"; message: string };
@@ -100,6 +104,17 @@ const GC_OPTIONS = {
   "older-than": { type: "string" },
   keep: { type: "string" },
   "kill-orphans": { type: "boolean" },
+  help: { type: "boolean" },
+} as const;
+
+const MERGE_OPTIONS = {
+  all: { type: "boolean" },
+  rm: { type: "boolean" },
+  help: { type: "boolean" },
+} as const;
+
+const RM_OPTIONS = {
+  force: { type: "boolean" },
   help: { type: "boolean" },
 } as const;
 
@@ -142,6 +157,8 @@ export function parseCli(argv: string[]): CliResult {
   if (verb === "logs") return parseLogs(rest);
   // `reap` is a hidden alias for `gc` — one concept, one implementation.
   if (verb === "gc" || verb === "reap") return parseGc(rest);
+  if (verb === "merge") return parseMerge(rest);
+  if (verb === "rm") return parseRm(rest);
   if (STUB_VERBS.has(verb)) return { kind: "stub", verb };
   return { kind: "error", message: `unknown command '${verb}'\n\n${USAGE}` };
 }
@@ -322,6 +339,61 @@ function parseGc(rest: string[]): CliResult {
   };
 }
 
+function parseMerge(rest: string[]): CliResult {
+  let values: Record<string, unknown>;
+  let positionals: string[];
+  try {
+    ({ values, positionals } = parseArgs({
+      args: rest,
+      allowPositionals: true,
+      options: MERGE_OPTIONS,
+    }));
+  } catch (error) {
+    return { kind: "error", message: msgOf(error) };
+  }
+
+  if (values.help) return { kind: "help", verb: "merge" };
+
+  const [target, ...branches] = positionals;
+  if (target === undefined) {
+    return { kind: "error", message: "merge requires a target (merge <target> [branches...])" };
+  }
+
+  return {
+    kind: "merge",
+    target,
+    branches,
+    all: (values.all as boolean | undefined) ?? false,
+    rm: (values.rm as boolean | undefined) ?? false,
+  };
+}
+
+function parseRm(rest: string[]): CliResult {
+  let values: Record<string, unknown>;
+  let positionals: string[];
+  try {
+    ({ values, positionals } = parseArgs({
+      args: rest,
+      allowPositionals: true,
+      options: RM_OPTIONS,
+    }));
+  } catch (error) {
+    return { kind: "error", message: msgOf(error) };
+  }
+
+  if (values.help) return { kind: "help", verb: "rm" };
+
+  const identifier = positionals[0];
+  if (identifier === undefined) {
+    return { kind: "error", message: "rm requires a branch or lane name" };
+  }
+  if (positionals.length > 1) {
+    return { kind: "error", message: `rm takes one positional argument (got '${positionals[1]}')` };
+  }
+
+  return { kind: "rm", identifier, force: (values.force as boolean | undefined) ?? false };
+}
+
 /** Parse a strictly-positive integer (`1`, `10`, …); undefined on anything else. */
 function parsePositiveInt(input: string): number | undefined {
   if (!/^\d+$/.test(input.trim())) return undefined;
@@ -340,6 +412,8 @@ export type CliDeps = {
   runList?: typeof runList;
   runLogs?: typeof runLogs;
   runGc?: typeof runGc;
+  runMerge?: typeof runMerge;
+  runRm?: typeof runRm;
   createEngine?: typeof createEngine;
   resolvePrompt?: typeof resolvePrompt;
 };
@@ -403,6 +477,30 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
       });
       return exitCode;
     }
+    case "merge": {
+      const merge = deps.runMerge ?? runMerge;
+      const { exitCode } = await merge({
+        repoRoot: cwd,
+        target: result.target,
+        branches: result.branches,
+        all: result.all,
+        rm: result.rm,
+        out,
+        err,
+      });
+      return exitCode;
+    }
+    case "rm": {
+      const rm = deps.runRm ?? runRm;
+      const { exitCode } = await rm({
+        repoRoot: cwd,
+        identifier: result.identifier,
+        force: result.force,
+        out,
+        err,
+      });
+      return exitCode;
+    }
     case "run-interactive": {
       const engine = (deps.createEngine ?? createEngine)({ cwd });
       return engine.runInteractive(result.branch);
@@ -448,7 +546,9 @@ commands:
   ls [--json] [--all]    list lanes reconciled against git worktrees
   logs <lane|branch>     print or tail a lane's log ([-f|--follow] [--lines <n>])
   gc                     heal, kill and prune stale/terminal lanes ([--dry-run] [--json] …)
-  new merge rm engine    (not implemented yet)
+  merge <target> [br...] safe merge-back into <target> ([--all] [--rm])
+  rm <lane|branch>       tear down a lane's worktree ([--force])
+  new engine             (not implemented yet)
 
 run 'agetree <command> --help' for command details`;
 
@@ -514,11 +614,42 @@ options:
 exit codes: 0 = ran cleanly (even nothing to do; a per-lane kill failure is
             reported, not fatal); 2 = operational error (bad flag / unreadable dir).`;
 
+const MERGE_HELP = `usage: agetree merge <target> [branches...] [--all] [--rm]
+
+  Safe merge-back of agent branches into <target>, delegated to the Bash engine
+  (dirty-worktree checks, clean-main check, conflict messaging, container
+  teardown). Accepts lane names or branch names, normalized to their branch.
+  This is a passthrough command — output and prompts behave exactly like the
+  engine; there is no --json.
+
+options:
+  --all    merge every agent worktree except the target (ignores [branches...])
+  --rm     remove each merged worktree, then prune its .agetree/ record + log
+           (only for a record whose worktree is verifiably gone afterwards)
+
+exit codes: the engine's exit code is preserved (0 = merged, non-zero = conflict
+            / dirty / other engine failure); 2 = agetree failed before the engine ran.`;
+
+const RM_HELP = `usage: agetree rm <branch-or-lane> [--force]
+
+  Tear down a lane's worktree by delegating to the Bash engine, then prune the
+  lane's .agetree/ record + log if its worktree is gone afterwards. Accepts a
+  lane name or a branch, normalized to its branch. Passthrough command (the
+  engine's container teardown and prompts behave exactly as usual); no --json.
+
+options:
+  --force   forwarded to the engine's rm
+
+exit codes: the engine's exit code is preserved (0 = removed); 2 = agetree
+            failed before the engine ran.`;
+
 function helpText(verb?: string): string {
   if (verb === "run") return `${RUN_HELP}\n`;
   if (verb === "ls") return `${LS_HELP}\n`;
   if (verb === "logs") return `${LOGS_HELP}\n`;
   if (verb === "gc") return `${GC_HELP}\n`;
+  if (verb === "merge") return `${MERGE_HELP}\n`;
+  if (verb === "rm") return `${RM_HELP}\n`;
   return `${USAGE}\n`;
 }
 
