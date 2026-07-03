@@ -185,6 +185,8 @@ export type RunHeadlessOptions = {
   name?: string;
   /** Adapter to drive the lane. Default `fake` for now (real CLIs land later). */
   adapter?: string;
+  /** Adapter model selection (from the namespaced `--claude-model`/`--amp-model`). */
+  model?: string;
   wait?: boolean;
   json?: boolean;
   /** Optional run budget (ms) used to classify a `timed-out` lane while waiting. */
@@ -252,6 +254,8 @@ export async function runHeadless(opts: RunHeadlessOptions): Promise<RunHeadless
       AGETREE_PROMPT: opts.prompt,
       AGETREE_ADAPTER: opts.adapter ?? "fake",
     };
+    // Omit-don't-empty: only set the model env when one was actually requested.
+    if (opts.model) childEnv.AGETREE_MODEL = opts.model;
     const pid = spawnDetachedSupervisor({
       command: process.execPath,
       args: nodeArgs,

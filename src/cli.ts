@@ -25,9 +25,9 @@ import { resolvePrompt, runHeadless } from "./run.ts";
 const STUB_VERBS = new Set(["new", "logs", "merge", "rm", "gc", "reap", "engine"]);
 
 /** Parsed `run` headless options. Captures the whole flag surface; the
- * dispatcher forwards only the fields the `runHeadless` entrypoint supports
- * today (model flags / idle-timeout / adapter-args are wired to the real
- * adapters in a later slice). */
+ * dispatcher forwards the fields the `runHeadless` entrypoint supports today
+ * (the adapter-appropriate model flag is threaded through; idle-timeout /
+ * adapter-args are wired to the real adapters in a later slice). */
 export type HeadlessArgs = {
   prompt?: string;
   promptFile?: string;
@@ -273,6 +273,9 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
         base: args.base,
         name: args.name,
         adapter: args.adapter,
+        // Namespaced model flags are per-adapter (no portable --model); pick the
+        // one matching the selected adapter and forward it as the generic model.
+        model: args.adapter === "amp" ? args.ampModel : args.claudeModel,
         wait: args.wait,
         json: args.json,
         timeoutMs: args.timeoutMs,

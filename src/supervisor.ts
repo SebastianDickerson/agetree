@@ -34,6 +34,8 @@ export type RunSupervisorOptions = {
   baseRef: string;
   prompt: string;
   adapter: Adapter;
+  /** Adapter model selection (e.g. from `--claude-model`), forwarded to `runLane`. */
+  model?: string;
   parentEnv?: NodeJS.ProcessEnv;
   supervisorPid?: number;
   supervisorStartedAt?: number;
@@ -89,6 +91,7 @@ export async function runLaneSupervisor(opts: RunSupervisorOptions): Promise<Lan
       cwd: opts.worktreePath,
       prompt: opts.prompt,
       allowAllTools: true,
+      model: opts.model,
       env: { AGETREE_DEPTH: nextAgetreeDepth(opts.parentEnv) },
       log,
     });

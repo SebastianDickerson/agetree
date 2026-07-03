@@ -242,6 +242,28 @@ describe("runCli — dispatch and exit-code passthrough", () => {
     );
   });
 
+  it("forwards --claude-model as the generic model when the adapter is claude", async () => {
+    const runHeadlessSpy = vi.fn(async () => ({ exitCode: 0 }));
+    await runCli(
+      ["run", "--prompt", "hi", "--agent", "claude", "--claude-model", "sonnet"],
+      { cwd: "/repo", out: collector(), err: collector(), runHeadless: runHeadlessSpy },
+    );
+    expect(runHeadlessSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ adapter: "claude", model: "sonnet" }),
+    );
+  });
+
+  it("forwards --amp-model (not --claude-model) when the adapter is amp", async () => {
+    const runHeadlessSpy = vi.fn(async () => ({ exitCode: 0 }));
+    await runCli(
+      ["run", "--prompt", "hi", "--agent", "amp", "--amp-model", "fast", "--claude-model", "sonnet"],
+      { cwd: "/repo", out: collector(), err: collector(), runHeadless: runHeadlessSpy },
+    );
+    expect(runHeadlessSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ adapter: "amp", model: "fast" }),
+    );
+  });
+
   it("interactive run delegates to engine.runInteractive and returns its code", async () => {
     const runInteractive = vi.fn(async () => 42);
     const engine: Engine = {

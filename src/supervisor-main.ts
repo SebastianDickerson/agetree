@@ -9,12 +9,14 @@
  *
  * Config env vars (all `AGETREE_`-namespaced): REPO_ROOT, WORKTREE, LANE_NAME,
  * BRANCH, BASE (empty ⇒ use the worktree's start HEAD as the range base),
- * PROMPT, ADAPTER (+ FAKE_SPEC for the fake adapter), DEPTH (parent depth,
- * forwarded to the agent as parent+1 by the supervisor).
+ * PROMPT, ADAPTER (+ FAKE_SPEC for the fake adapter), MODEL (adapter model, e.g.
+ * from `--claude-model`), DEPTH (parent depth, forwarded to the agent as
+ * parent+1 by the supervisor).
  */
 
 import { execFileSync } from "node:child_process";
 import type { Adapter } from "./adapter.ts";
+import { createClaudeAdapter } from "./adapters/claude.ts";
 import { createFakeAdapter } from "./adapters/fake.ts";
 import { runLaneSupervisor } from "./supervisor.ts";
 
@@ -30,7 +32,9 @@ function buildAdapter(name: string, env: NodeJS.ProcessEnv): Adapter {
       const raw = env.AGETREE_FAKE_SPEC;
       return createFakeAdapter(raw ? JSON.parse(raw) : {});
     }
-    // The real claude/amp adapters are wired in a later slice.
+    case "claude":
+      return createClaudeAdapter();
+    // The Amp adapter is wired in its own later slice.
     default:
       throw new Error(`supervisor entrypoint: unknown adapter '${name}'`);
   }
@@ -48,6 +52,7 @@ async function main(): Promise<void> {
     env.AGETREE_BASE ||
     execFileSync("git", ["rev-parse", "HEAD"], { cwd: worktreePath, encoding: "utf8" }).trim();
   const adapter = buildAdapter(env.AGETREE_ADAPTER ?? "fake", env);
+  const model = env.AGETREE_MODEL || undefined;
 
   await runLaneSupervisor({
     repoRoot,
@@ -57,6 +62,7 @@ async function main(): Promise<void> {
     baseRef,
     prompt,
     adapter,
+    model,
     parentEnv: env,
   });
 }

@@ -3,6 +3,7 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { Adapter } from "./adapter.ts";
 import { createFakeAdapter } from "./adapters/fake.ts";
 import { readLaneRecord, statePaths } from "./lane-store.ts";
 import { STATUS } from "./lane-state.ts";
@@ -197,6 +198,44 @@ describe("runLaneSupervisor", () => {
     expect(sh(repo, ["git", "status", "--porcelain", "--untracked-files=all"])).toContain(
       "src/work.txt",
     );
+  });
+
+  it("forwards opts.model to the adapter's buildCommand (RunOptions.model)", async () => {
+    const { repo } = freshRepo();
+    let seenModel: string | undefined = "unset";
+    // A minimal real adapter: records the model it was handed, then spawns a
+    // trivial node command emitting a parseable result (no external CLI).
+    const adapter: Adapter = {
+      name: "recorder",
+      buildCommand(opts) {
+        seenModel = opts.model;
+        return {
+          cmd: process.execPath,
+          args: ["-e", "process.stdout.write(JSON.stringify({ result: 'ok' }))"],
+        };
+      },
+      parse: ({ stdout, exitCode }) => ({
+        adapter: "recorder",
+        finalMessage: JSON.parse(stdout).result,
+        exitCode,
+        isError: exitCode !== 0,
+      }),
+    };
+
+    await runLaneSupervisor({
+      repoRoot: repo,
+      worktreePath: repo,
+      name: "modeled",
+      branch: "agetree/feature-x",
+      baseRef: "main",
+      prompt: "go",
+      adapter,
+      model: "sonnet",
+      supervisorPid: 4321,
+      supervisorStartedAt: 1_234,
+    });
+
+    expect(seenModel).toBe("sonnet");
   });
 
   it("creates the lane log with 0o600 permissions (logs can contain secrets)", async () => {

@@ -2,8 +2,11 @@ import { describe, expect, it } from "vitest";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Writable } from "node:stream";
+import type { Engine } from "./engine.ts";
 import type { LaneRecord } from "./lane-state.ts";
-import { autoName, formatOutput, resolvePrompt } from "./run.ts";
+import { autoName, formatOutput, resolvePrompt, runHeadless } from "./run.ts";
+import type { SpawnProcess } from "./supervisor.ts";
 
 function doneRecord(): LaneRecord {
   return {
@@ -26,6 +29,67 @@ function doneRecord(): LaneRecord {
     },
   };
 }
+
+function sink(): Writable {
+  return new Writable({ write: (_c, _e, cb) => cb() });
+}
+
+/** A no-op engine whose ensureWorktree returns a fixed path (no real git). */
+function stubEngine(): Engine {
+  return {
+    ensureWorktree: async (branch) => ({ branch, path: "/lane/wt" }),
+    runInteractive: async () => 0,
+    merge: async () => 0,
+    remove: async () => 0,
+  };
+}
+
+describe("runHeadless — model plumbing into the supervisor spawn env", () => {
+  it("sets AGETREE_MODEL in the detached supervisor env when a model is given", async () => {
+    let capturedEnv: NodeJS.ProcessEnv | undefined;
+    const spawn: SpawnProcess = (_cmd, _args, opts) => {
+      capturedEnv = opts.env;
+      return { pid: 4321, unref: () => {} };
+    };
+
+    await runHeadless({
+      repoRoot: "/repo",
+      prompt: "do it",
+      branch: "agetree/feature-x",
+      adapter: "claude",
+      model: "sonnet",
+      engine: stubEngine(),
+      spawn,
+      out: sink(),
+      err: sink(),
+    });
+
+    expect(capturedEnv?.AGETREE_ADAPTER).toBe("claude");
+    expect(capturedEnv?.AGETREE_MODEL).toBe("sonnet");
+  });
+
+  it("omits AGETREE_MODEL entirely when no model is given", async () => {
+    let capturedEnv: NodeJS.ProcessEnv | undefined;
+    const spawn: SpawnProcess = (_cmd, _args, opts) => {
+      capturedEnv = opts.env;
+      return { pid: 4321, unref: () => {} };
+    };
+
+    await runHeadless({
+      repoRoot: "/repo",
+      prompt: "do it",
+      branch: "agetree/feature-x",
+      adapter: "claude",
+      engine: stubEngine(),
+      spawn,
+      out: sink(),
+      err: sink(),
+    });
+
+    expect(capturedEnv).toBeDefined();
+    expect(capturedEnv).not.toHaveProperty("AGETREE_MODEL");
+  });
+});
 
 describe("autoName", () => {
   it("uses an explicit branch verbatim and derives a filesystem-safe lane name", () => {
